@@ -1,0 +1,4 @@
+build/
+dmg_staging/
+*.dmg
+.DS_Store

@@ -21,10 +21,13 @@
 - **覆盖前自动备份**：导入与现有文件冲突时，旧文件先备份到 `~/.workbuddy/migrate_backups/<时间戳>/`，不丢任何数据。
 - **工作区缺失兜底归档**：导入包内的工作区在新机器上不存在对应目录时，自动归档到 `~/.workbuddy/workspace_memory_archive/`，绝不为迁而丢。
 - **实时进度条**：导出 / 导入全程显示百分比与阶段提示。
+- **对话自选 + 账号过户**：导入时可逐条勾选要恢复的对话；恢复的会话自动过户到当前账号（跨账号导入不再「隐身」），并按导入映射自动改写会话工作目录（cwd），失效目录还会按名称自动探测挪位后的新位置。
+- **工作区缺失自动落位**：目标工作区不存在时按**原目录结构**自动创建（如 `~/Downloads/workbuddy 项目/X` 原样重建）并注册进 workspaces 表，WorkBuddy 直接认出；可选改为归档模式。
+- **自定义扫描路径**：把项目挪入的「收容所」文件夹加入扫描设置（深度 6 层），导出/导入自动跟上挪过位置的工作区。
 - 原生 SwiftUI App，Universal（Apple Silicon + Intel），最低 macOS 12，拖入「应用程序」即用，无依赖脚本。
 
 ### 快速开始
-1. 在 Releases 下载 `12-WBMemoryMigrator-1.0-universal.dmg`。
+1. 在 Releases 下载 `12-WBMemoryMigrator-1.1-universal.dmg`。
 2. 打开 DMG，把 `WBMemoryMigrator.app` 拖入「应用程序」。
 3. 首次打开：右键 → 打开（或终端执行 `xattr -dr com.apple.quarantine /Applications/WBMemoryMigrator.app`）。
 4. 勾选要迁移的数据类别 → 点击「导出」，得到一个 zip 备份包。
@@ -71,10 +74,13 @@ bash make_dmg.sh   # hdiutil 打包 DMG
 - **Automatic pre-overwrite backup**: on conflicts, existing files are backed up to `~/.workbuddy/migrate_backups/<timestamp>/` first — nothing gets lost.
 - **Fallback archiving**: if a workspace from the backup doesn't exist on the new machine, its data is archived to `~/.workbuddy/workspace_memory_archive/` instead of being dropped.
 - **Real-time progress**: percentage + phase text throughout export / import.
+- **Conversation picking + account takeover**: tick individual conversations to restore; restored sessions are automatically re-owned to the current account (no more "invisible" imports across accounts), with session working directories (cwd) remapped per import mapping — and moved folders are auto-detected by name.
+- **Auto-create missing workspaces**: recreates the **original directory structure** (e.g. `~/Downloads/workbuddy 项目/X`) and registers it in the workspaces table so WorkBuddy recognizes it immediately; archive mode available as an alternative.
+- **Custom scan roots**: register "relocation vault" folders (scanned 6 levels deep) so export/import automatically follow moved workspaces.
 - Native SwiftUI app, Universal (Apple Silicon + Intel), minimum macOS 12 — drag into Applications and it just works, no helper scripts.
 
 ### Quick start
-1. Download `12-WBMemoryMigrator-1.0-universal.dmg` from Releases.
+1. Download `12-WBMemoryMigrator-1.1-universal.dmg` from Releases.
 2. Open the DMG and drag `WBMemoryMigrator.app` into Applications.
 3. First launch: right-click → Open (or run `xattr -dr com.apple.quarantine /Applications/WBMemoryMigrator.app` in Terminal).
 4. Check the categories you want → click Export → get a single zip backup.

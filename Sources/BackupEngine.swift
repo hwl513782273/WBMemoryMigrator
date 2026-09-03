@@ -17,6 +17,26 @@ struct Manifest: Codable {
     let appVersion: String
     let createdAt: String
     let items: [ExportItem]
+    let homeDir: String?   // 导出机器的家目录（用于导入时按原目录结构重建）
+
+    init(appVersion: String, createdAt: String, items: [ExportItem], homeDir: String?) {
+        self.appVersion = appVersion
+        self.createdAt = createdAt
+        self.items = items
+        self.homeDir = homeDir
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        appVersion = try c.decode(String.self, forKey: .appVersion)
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        items = try c.decode([ExportItem].self, forKey: .items)
+        homeDir = try c.decodeIfPresent(String.self, forKey: .homeDir)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case appVersion, createdAt, items, homeDir
+    }
 }
 
 /// 项目空间迁移选择：工作区根绝对路径 -> 勾中的顶层条目名列表
@@ -51,7 +71,7 @@ struct WorkspaceEntryOption: Identifiable {
 // 项目空间默认排除的膨胀项（默认不勾，可在 UI 手动加回）
 let defaultProjectExcludes = Set<String>([
     "node_modules", ".git", "build", "DerivedData", ".build",
-    "Pods", "vendor", "dist", "out", ".DS_Store"
+    "Pods", "vendor", "dist", "out", ".DS_Store", "staging"
 ])
 
 // MARK: - 扩展
@@ -117,12 +137,15 @@ final class BackupEngine {
         p.arguments = args
         if let cd = currentDir { p.currentDirectoryURL = URL(fileURLWithPath: cd) }
         let err = Pipe()
+        var errData = Data()
+        // 实时读取 stderr，防止输出超过 64KB 管道缓冲导致死锁
+        err.fileHandleForReading.readabilityHandler = { h in errData.append(h.availableData) }
         p.standardError = err
         try p.run()
         p.waitUntilExit()
+        err.fileHandleForReading.readabilityHandler = nil
         if p.terminationStatus != 0 {
-            let data = err.fileHandleForReading.readDataToEndOfFile()
-            let msg = String(data: data, encoding: .utf8) ?? "unknown"
+            let msg = String(data: errData, encoding: .utf8) ?? "unknown"
             throw NSError(domain: "BackupEngine",
                           code: Int(p.terminationStatus),
                           userInfo: [NSLocalizedDescriptionKey: "命令失败: \(args.joined(separator: " "))\n\(msg)"])
@@ -150,9 +173,9 @@ final class BackupEngine {
     }
 
     /// 列出所有工作区的顶层条目（供 UI 勾选），含大小与默认排除态
-    func projectSpaceOptions() -> [WorkspaceEntryOption] {
+    func projectSpaceOptions(log: ((String) -> Void)? = nil) -> [WorkspaceEntryOption] {
         var out: [WorkspaceEntryOption] = []
-        for wp in workspacePaths() {
+        for wp in resolveWorkspaces(log: log) {
             guard let urls = try? fm.contentsOfDirectory(at: URL(fileURLWithPath: wp),
                            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey]) else { continue }
             for u in urls {
@@ -246,15 +269,15 @@ final class BackupEngine {
             tasks.append(ColTask(src: (wb as NSString).appendingPathComponent("skills"),
                                  cat: "userSkills", rel: "skills"))
         }
-        for wp in workspacePaths() {
+        for wp in resolveWorkspaces(log: log) {
             let key = safeName(wp)
             if options.longTermMemory {
                 tasks.append(ColTask(src: (wp as NSString).appendingPathComponent(".workbuddy/memory"),
-                                     cat: "workspaceMemory", rel: "workspaces/\(key)/memory"))
+                                     cat: "workspaceMemory", rel: "workspaces/\(key)/memory", workspaceRoot: wp))
             }
             if options.skills {
                 tasks.append(ColTask(src: (wp as NSString).appendingPathComponent(".workbuddy/skills"),
-                                     cat: "workspaceSkills", rel: "workspaces/\(key)/skills"))
+                                     cat: "workspaceSkills", rel: "workspaces/\(key)/skills", workspaceRoot: wp))
             }
         }
         // 项目空间：仅收集用户勾选的工作区顶层条目
@@ -317,24 +340,126 @@ final class BackupEngine {
         // 清单
         let manifest = Manifest(appVersion: version,
                                 createdAt: ISO8601DateFormatter().string(from: Date()),
-                                items: items)
+                                items: items, homeDir: homeDir())
         let mdata = try JSONEncoder().encode(manifest)
         try mdata.write(to: URL(fileURLWithPath:
             (staging as NSString).appendingPathComponent("manifest.json")))
 
-        // 打包
-        progress(0.78, "正在打包压缩…")
+        // 打包（异步执行，按 zip 体积增长实时反馈进度，避免长时间停在 78%）
+        progress(0.78, "正在打包压缩…（大包耗时较久，进度按压缩体积估算）")
         try fm.removeItemIfExists(atPath: zipPath)
-        try run("/usr/bin/zip", ["-r", "-q", zipPath, "."], currentDir: staging)
+        let stagingBytes = max(sizeOf(staging), 1)
+        let zipProc = Process()
+        zipProc.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        // -y：符号链接按链接本身存储，不跟随（防止链接指向 /Applications 等巨目录甚至链接环路）
+        zipProc.arguments = ["-r", "-q", "-y", zipPath, "."]
+        zipProc.currentDirectoryURL = URL(fileURLWithPath: staging)
+        let zipErr = Pipe()
+        var zipErrData = Data()
+        zipErr.fileHandleForReading.readabilityHandler = { h in zipErrData.append(h.availableData) }
+        zipProc.standardError = zipErr
+        try zipProc.run()
+        while zipProc.isRunning {
+            Thread.sleep(forTimeInterval: 0.5)
+            var frac = 0.0
+            if let attr = try? fm.attributesOfItem(atPath: zipPath),
+               let bytes = attr[.size] as? Int64 {
+                frac = min(Double(bytes) / Double(stagingBytes), 1.0)
+            }
+            progress(0.78 + 0.2 * frac, "正在打包压缩…（大包耗时较久，进度按压缩体积估算）")
+        }
+        zipProc.waitUntilExit()
+        zipErr.fileHandleForReading.readabilityHandler = nil
+        if zipProc.terminationStatus != 0 {
+            let msg = String(data: zipErrData, encoding: .utf8) ?? "unknown"
+            throw NSError(domain: "BackupEngine",
+                          code: Int(zipProc.terminationStatus),
+                          userInfo: [NSLocalizedDescriptionKey: "打包失败: \(msg)"])
+        }
         progress(1.0, "完成")
         log("打包完成：\(zipPath)  共 \(items.count) 项")
         try? fm.removeItem(atPath: staging)
     }
 
+    // MARK: 导入范围过滤
+
+    struct ImportOptions {
+        var memory = true
+        var conversations = true
+        var skills = true
+        var projectSpaces = true
+        // 对话自选：nil=恢复包内全部；非 nil=只保留集合内会话（其余 db 行与对话文件删除）
+        var selectedSessions: Set<String>? = nil
+        // 账号过户：nil=自动探测本机现有账号 id
+        var targetUserId: String? = nil
+        // 目标工作区不存在时：false=自动创建并注册（默认），true=归档到 workspace_memory_archive
+        var archiveMissingWorkspaces = false
+
+        func allows(_ category: String) -> Bool {
+            switch category {
+            case "userMemory", "memoryCache", "workspaceArchive", "workspaceMemory":
+                return memory
+            case "sessions", "projects", "conversationsDB":
+                return conversations
+            case "userSkills", "workspaceSkills":
+                return skills
+            case "projectSpace":
+                return projectSpaces
+            default:
+                return true
+            }
+        }
+    }
+
+    struct ImportCategorySummary {
+        let key: String      // memory / conversations / skills / projectSpaces
+        let count: Int
+        let size: Int64
+    }
+
+    private func groupKey(_ cat: String) -> String {
+        switch cat {
+        case "userMemory", "memoryCache", "workspaceArchive", "workspaceMemory":
+            return "memory"
+        case "sessions", "projects", "conversationsDB":
+            return "conversations"
+        case "userSkills", "workspaceSkills":
+            return "skills"
+        case "projectSpace":
+            return "projectSpaces"
+        default:
+            return "other"
+        }
+    }
+
+    /// 包内各类别统计（供导入范围勾选显示）
+    func importSummary(zip: String) throws -> [ImportCategorySummary] {
+        let tmp = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("wbmem_sum_\(Int(Date().timeIntervalSince1970))")
+        try fm.removeItemIfExists(atPath: tmp)
+        try fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        try run("/usr/bin/unzip", ["-q", zip, "-d", tmp])
+        let man = (tmp as NSString).appendingPathComponent("manifest.json")
+        let data = try Data(contentsOf: URL(fileURLWithPath: man))
+        let m = try JSONDecoder().decode(Manifest.self, from: data)
+        try? fm.removeItem(atPath: tmp)
+        var agg: [String: (Int, Int64)] = [:]
+        for item in m.items {
+            let k = groupKey(item.category)
+            let e = agg[k] ?? (0, 0)
+            agg[k] = (e.0 + 1, e.1 + item.size)
+        }
+        var out: [ImportCategorySummary] = []
+        for k in ["memory", "conversations", "skills", "projectSpaces"] {
+            if let e = agg[k] { out.append(ImportCategorySummary(key: k, count: e.0, size: e.1)) }
+        }
+        return out
+    }
+
     // MARK: 预览
 
     /// 导入预览：返回「将恢复到本机的目标路径」清单（工作区不存在时标注跳过）
-    func preview(zip: String) throws -> [String] {
+    func preview(zip: String, options: ImportOptions? = nil) throws -> [String] {
         let tmp = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("wbmem_prev_\(Int(Date().timeIntervalSince1970))")
         try fm.removeItemIfExists(atPath: tmp)
@@ -346,22 +471,196 @@ final class BackupEngine {
         try? fm.removeItem(atPath: tmp)
         var lines: [String] = []
         for item in m.items {
+            if let o = options, !o.allows(item.category) { continue }
             if item.category == "projectSpace" {
-                lines.append("→ \(item.realPath)  （项目空间 · \(fmt(item.size)) · 导入时选择目标目录）")
+                var note = "未选目录→自动落位"
+                if let root = item.workspaceRoot, !fm.fileExists(atPath: root) {
+                    let ar = autoRoot(for: root, manifestHome: m.homeDir)
+                    note = "原路径不存在→自动创建并注册: \(ar)"
+                }
+                lines.append("→ \(item.realPath)  （项目空间 · \(fmt(item.size)) · \(note)）")
                 continue
             }
-            let dst = resolveDst(item)
+            var dst = resolveDst(item)
             var note = ""
             if item.category == "workspaceMemory" || item.category == "workspaceSkills" {
-                let wsRoot = (dst as NSString).deletingLastPathComponent
-                let wsGrand = (wsRoot as NSString).deletingLastPathComponent
-                if !fm.fileExists(atPath: wsGrand) {
-                    note = "  ⚠️ 目标工作区不存在，将归档到 ~/.workbuddy/workspace_memory_archive/\(safeName(wsGrand))"
+                let oldWsRoot = item.workspaceRoot
+                    ?? (((dst as NSString).deletingLastPathComponent) as NSString).deletingLastPathComponent
+                if !fm.fileExists(atPath: oldWsRoot) {
+                    let sub = item.category == "workspaceMemory" ? "memory" : "skills"
+                    let newRoot = autoRoot(for: oldWsRoot, manifestHome: m.homeDir)
+                    dst = (newRoot as NSString).appendingPathComponent(".workbuddy/\(sub)")
+                    note = "  ⚠️ 目标工作区不存在→自动创建并注册: \(newRoot)"
                 }
             }
             lines.append("→ \(dst)  （\(item.category) · \(fmt(item.size))）\(note)")
         }
         return lines
+    }
+
+    struct PackageConversation: Identifiable {
+        let id: String
+        let title: String
+        let cwd: String
+        let userId: String
+        let updatedAt: Int64
+    }
+
+    private func sqliteOut(_ db: String, _ sql: String) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        p.arguments = [db, sql]
+        let out = Pipe()
+        var outData = Data()
+        // 实时读取 stdout，防 >64KB 管道死锁
+        out.fileHandleForReading.readabilityHandler = { h in outData.append(h.availableData) }
+        p.standardOutput = out
+        p.standardError = Pipe()
+        try? p.run()
+        p.waitUntilExit()
+        out.fileHandleForReading.readabilityHandler = nil
+        return String(data: outData, encoding: .utf8) ?? ""
+    }
+
+    /// 包内会话清单（供导入侧勾选）
+    func conversationsInPackage(zip: String) throws -> [PackageConversation] {
+        let tmp = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("wbmem_conv_\(Int(Date().timeIntervalSince1970))")
+        try fm.removeItemIfExists(atPath: tmp)
+        try fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        try run("/usr/bin/unzip", ["-q", zip, "-d", tmp])
+        defer { try? fm.removeItem(atPath: tmp) }
+        let db = (tmp as NSString).appendingPathComponent("conversations/workbuddy.db")
+        guard fm.fileExists(atPath: db) else { return [] }
+        let sql = "SELECT id || char(31) || COALESCE(NULLIF(custom_title,''), IFNULL(title,'(无标题)')) || char(31) || IFNULL(cwd,'') || char(31) || user_id || char(31) || IFNULL(updated_at,0) FROM sessions ORDER BY updated_at DESC;"
+        let out = sqliteOut(db, sql)
+        return out.split(separator: "\n").compactMap { line in
+            let f = line.components(separatedBy: "\u{1F}")
+            guard f.count >= 5 else { return nil }
+            return PackageConversation(id: f[0], title: f[1], cwd: f[2],
+                                       userId: f[3], updatedAt: Int64(f[4]) ?? 0)
+        }
+    }
+
+    /// 本机现有会话最多的 user_id（账号过户默认目标）
+    func localUserId() -> String? {
+        let db = (wbDir() as NSString).appendingPathComponent("workbuddy.db")
+        guard fm.fileExists(atPath: db) else { return nil }
+        let out = sqliteOut(db, "SELECT user_id FROM sessions GROUP BY user_id ORDER BY count(*) DESC LIMIT 1;")
+        let t = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    /// 导出侧：把 workspaces 表登记的失效路径自动探测到挪位后的新位置
+    func resolveWorkspaces(log: ((String) -> Void)? = nil) -> [String] {
+        var out: [String] = []
+        for wp in workspacePaths() {
+            if fm.fileExists(atPath: wp) { out.append(wp); continue }
+            let name = (wp as NSString).lastPathComponent
+            let hits = findFolder(named: name)
+            if hits.count == 1 {
+                out.append(hits[0])
+                log?("已探测到工作区挪位: 「\(name)」\(wp) → \(hits[0])（本次按新位置收集）")
+            } else if hits.count > 1 {
+                let cand = hits.prefix(3).joined(separator: "  |  ")
+                log?("⚠️ 工作区「\(name)」命中 \(hits.count) 处，无法自动确定：\(cand)\(hits.count > 3 ? " 等" : "")。本次导出跳过，请在「扫描设置」清理或手动处理")
+            } else {
+                log?("⚠️ 工作区「\(name)」登记路径已失效且未找到新位置（含自定义扫描路径），本次导出跳过其数据")
+            }
+        }
+        return out
+    }
+
+    /// 工作区缺失时的落位：优先按原 home 相对结构重建（/Users/old/Downloads/X → ~/Downloads/X），
+    /// 原路径不在家目录内（如外置盘）或旧清单未记录 home 时回退 ~/WorkBuddy/<名>
+    func autoRoot(for oldRoot: String, manifestHome: String?) -> String {
+        // 老包无 homeDir 字段时的兜底推断：/Users/<名>/... 且 <名> 与当前用户一致 → 原 home 即当前 home
+        var inferredHome: String? = manifestHome
+        if (inferredHome == nil || inferredHome!.isEmpty), oldRoot.hasPrefix("/Users/") {
+            let comps = oldRoot.split(separator: "/")
+            if comps.count >= 2 {
+                let name = String(comps[1])
+                if name == (homeDir() as NSString).lastPathComponent {
+                    inferredHome = "/Users/\(name)"
+                }
+            }
+        }
+        if let oh = inferredHome, !oh.isEmpty, oldRoot.hasPrefix(oh), oldRoot != oh {
+            let rel = String(oldRoot.dropFirst(oh.count))
+            if rel.hasPrefix("/") {
+                let preferred = (homeDir() as NSString).appendingPathComponent(rel)
+                if !fm.fileExists(atPath: preferred) { return preferred }
+                // 被占用：加 -imported 后缀，绝不覆盖
+                var n = 1
+                while true {
+                    let cand = n == 1 ? preferred + "-imported" : preferred + "-imported-\(n)"
+                    if !fm.fileExists(atPath: cand) { return cand }
+                    n += 1
+                }
+            }
+        }
+        return wsAutoCreateRoot(oldRoot)
+    }
+
+    /// 工作区缺失时的自动创建目标：~/WorkBuddy/<名>（被占用则 -imported 后缀）
+    func wsAutoCreateRoot(_ oldRoot: String) -> String {
+        let name = (oldRoot as NSString).lastPathComponent
+        let base = (homeDir() as NSString).appendingPathComponent("WorkBuddy")
+        var root = (base as NSString).appendingPathComponent(name)
+        if root == oldRoot { return root }
+        var n = 1
+        while fm.fileExists(atPath: root) {
+            n += 1
+            root = (base as NSString).appendingPathComponent(n == 2 ? "\(name)-imported" : "\(name)-imported-\(n - 1)")
+        }
+        return root
+    }
+
+    /// 按文件夹名搜索（内置常见位置深度 4；用户自定义扫描根深度 6），返回全部命中
+    func findFolder(named name: String, maxDepth: Int = 4) -> [String] {
+        var out: [String] = []
+        var seen: Set<String> = []
+        let home = homeDir()
+        var roots: [(String, Int)] = [(home + "/WorkBuddy", maxDepth),
+                                      (home + "/Downloads", maxDepth),
+                                      (home + "/Desktop", maxDepth),
+                                      (home + "/Documents", maxDepth),
+                                      (home, maxDepth)]
+        for c in customScanRoots() { roots.append((c, 6)) }
+        func walk(_ dir: String, _ depth: Int, _ limit: Int) {
+            guard depth <= limit,
+                  let items = try? fm.contentsOfDirectory(atPath: dir) else { return }
+            for it in items {
+                if it.hasPrefix(".") || it == "Library" { continue }
+                let p = (dir as NSString).appendingPathComponent(it)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue else { continue }
+                if it == name { out.append(p) }
+                walk(p, depth + 1, limit)
+            }
+        }
+        for (r, md) in roots {
+            if seen.contains(r) || !fm.fileExists(atPath: r) { continue }
+            seen.insert(r)
+            walk(r, 1, md)
+        }
+        return Array(Set(out)).sorted()
+    }
+
+    // MARK: 自定义扫描根目录（用户指定的「挪入收容所」路径，持久化到 ~/.workbuddy/scan_roots.txt）
+
+    func customScanRoots() -> [String] {
+        let f = (wbDir() as NSString).appendingPathComponent("scan_roots.txt")
+        guard let t = try? String(contentsOfFile: f, encoding: .utf8) else { return [] }
+        return t.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && fm.fileExists(atPath: $0) }
+    }
+
+    func setCustomScanRoots(_ roots: [String]) {
+        let f = (wbDir() as NSString).appendingPathComponent("scan_roots.txt")
+        try? roots.joined(separator: "\n")
+            .write(to: URL(fileURLWithPath: f), atomically: true, encoding: .utf8)
     }
 
     /// 读取备份内包含的项目空间工作区根（供导入侧映射目标目录）
@@ -384,7 +683,8 @@ final class BackupEngine {
 
     func importBackup(from zip: String, log: @escaping (String) -> Void,
                       progress: @escaping (Double, String) -> Void,
-                      projectTargets: [String: String] = [:]) throws {
+                      projectTargets: [String: String] = [:],
+                      importOptions: ImportOptions = ImportOptions()) throws {
         let tmp = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("wbmem_imp_\(Int(Date().timeIntervalSince1970))")
         try fm.removeItemIfExists(atPath: tmp)
@@ -396,16 +696,29 @@ final class BackupEngine {
         let data = try Data(contentsOf: URL(fileURLWithPath: man))
         let m = try JSONDecoder().decode(Manifest.self, from: data)
 
+        // 账号过户：覆盖前先探测本机现有账号 id（覆盖后原 user_id 信息仍在会话行里，但本机旧库已无）
+        let detectedLocalUserId = localUserId()
+
         let ts = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
         let backupRoot = (wbDir() as NSString).appendingPathComponent("migrate_backups/\(ts)")
         try fm.createDirectory(atPath: backupRoot, withIntermediateDirectories: true)
 
         let total = Double(max(m.items.count, 1))
+        var skipped = 0
         for (i, item) in m.items.enumerated() {
+            if !importOptions.allows(item.category) {
+                skipped += 1
+                log("按导入范围跳过: \(item.category) \(item.bundleRel)")
+                continue
+            }
             restore(item: item, fromStaging: tmp, backupRoot: backupRoot, log: log,
-                    projectTargets: projectTargets)
+                    projectTargets: projectTargets, importOptions: importOptions,
+                    manifestHome: m.homeDir)
             progress(0.1 + 0.9 * Double(i + 1) / total, "正在还原文件…")
+        }
+        if skipped > 0 {
+            log("已按导入范围跳过 \(skipped) 项（未勾选的类别不会被改动）")
         }
 
         // 项目空间路径重映射：刷新 workspaces 表，让 WorkBuddy 在新机器认出工作区
@@ -421,6 +734,68 @@ final class BackupEngine {
             }
         }
 
+        // 对话记忆后处理：自选保留 + 账号过户 + cwd 重映射 + 自动探测挪位文件夹
+        if importOptions.conversations {
+            let db = (wbDir() as NSString).appendingPathComponent("workbuddy.db")
+            if fm.fileExists(atPath: db) {
+                // 1) 对话自选：只保留勾选会话（db 行 + 对话文件）
+                if let sel = importOptions.selectedSessions {
+                    if sel.isEmpty {
+                        try? run("/usr/bin/sqlite3", [db, "DELETE FROM sessions;"])
+                        try? run("/usr/bin/sqlite3", [db, "DELETE FROM session_usage;"])
+                    } else {
+                        let idList = sel.map { "'\(sqlEsc($0))'" }.joined(separator: ",")
+                        try? run("/usr/bin/sqlite3", [db, "DELETE FROM sessions WHERE id NOT IN (\(idList));"])
+                        try? run("/usr/bin/sqlite3", [db, "DELETE FROM session_usage WHERE session_id NOT IN (\(idList));"])
+                    }
+                    log("按勾选保留会话 \(sel.count) 条，其余 db 行已删除")
+                    let keepOut = sqliteOut(db, "SELECT id FROM sessions;")
+                    let keep = Set(keepOut.split(separator: "\n").map(String.init))
+                    let projRoot = (wbDir() as NSString).appendingPathComponent("projects")
+                    if let subdirs = try? fm.contentsOfDirectory(atPath: projRoot) {
+                        for sub in subdirs {
+                            let sd = (projRoot as NSString).appendingPathComponent(sub)
+                            guard let items = try? fm.contentsOfDirectory(atPath: sd) else { continue }
+                            for it in items {
+                                let stem = it.hasSuffix(".jsonl") ? String(it.dropLast(6)) : it
+                                if !keep.contains(stem) {
+                                    try? fm.removeItem(atPath: (sd as NSString).appendingPathComponent(it))
+                                }
+                            }
+                        }
+                    }
+                    log("未勾选会话的对话文件已清理")
+                }
+                // 2) 账号过户
+                if let target = importOptions.targetUserId ?? detectedLocalUserId, !target.isEmpty {
+                    try? run("/usr/bin/sqlite3", [db, "UPDATE sessions SET user_id='\(sqlEsc(target))' WHERE user_id <> '\(sqlEsc(target))';"])
+                    log("已过户会话到账号: \(target)\(importOptions.targetUserId == nil ? "（自动探测）" : "")")
+                } else {
+                    log("⚠️ 未探测到本机账号 id，会话 user_id 未改写（请在 UI 手动填写目标账号）")
+                }
+                // 3) cwd 按项目空间映射重写
+                for (oldRoot, newRoot) in projectTargets {
+                    let eo = sqlEsc(oldRoot), en = sqlEsc(newRoot)
+                    try? run("/usr/bin/sqlite3", [db, "UPDATE sessions SET cwd='\(en)' || substr(cwd, length('\(eo)')+1) WHERE cwd='\(eo)' OR cwd LIKE '\(eo)/%';"])
+                }
+                // 4) cwd 自动探测挪位文件夹（按文件夹名在常见位置唯一匹配才改）
+                let deadOut = sqliteOut(db, "SELECT DISTINCT cwd FROM sessions WHERE cwd IS NOT NULL AND cwd <> '';")
+                for cwd in deadOut.split(separator: "\n").map(String.init) where !fm.fileExists(atPath: cwd) {
+                    let name = (cwd as NSString).lastPathComponent
+                    let hits = findFolder(named: name)
+                    if hits.count == 1 {
+                        try? run("/usr/bin/sqlite3", [db, "UPDATE sessions SET cwd='\(sqlEsc(hits[0]))' WHERE cwd='\(sqlEsc(cwd))';"])
+                        log("cwd 自动探测: 「\(name)」→ \(hits[0])")
+                    } else if hits.count > 1 {
+                        let cand = hits.prefix(3).joined(separator: "  |  ")
+                        log("⚠️ cwd 自动探测: 「\(name)」命中 \(hits.count) 处未改动：\(cand)\(hits.count > 3 ? " 等" : "")")
+                    } else {
+                        log("⚠️ cwd 自动探测: 「\(name)」未找到新位置（含自定义扫描路径），相关会话仍会提示目录不存在")
+                    }
+                }
+            }
+        }
+
         progress(1.0, "完成")
         try? fm.removeItem(atPath: tmp)
         log("导入完成。被覆盖的原文件已备份到：\(backupRoot)")
@@ -428,7 +803,9 @@ final class BackupEngine {
 
     private func restore(item: ExportItem, fromStaging tmp: String,
                          backupRoot: String, log: @escaping (String) -> Void,
-                         projectTargets: [String: String] = [:]) {
+                         projectTargets: [String: String] = [:],
+                         importOptions: ImportOptions = ImportOptions(),
+                         manifestHome: String? = nil) {
         let src = (tmp as NSString).appendingPathComponent(item.bundleRel)
         guard fm.fileExists(atPath: src) else {
             log("跳过(包内缺失): \(item.bundleRel)")
@@ -436,11 +813,23 @@ final class BackupEngine {
         }
 
         // 解析目标路径：项目空间按导入映射重定位，其余按原逻辑
-        let dst: String
+        var dst: String
         if item.category == "projectSpace" {
             if let root = item.workspaceRoot, let nr = projectTargets[root] {
                 let entryName = (item.realPath as NSString).lastPathComponent
                 dst = (nr as NSString).appendingPathComponent(entryName)
+            } else if let root = item.workspaceRoot, !fm.fileExists(atPath: root) {
+                // 未选目标目录且原路径本机不存在 → 按原目录结构自动创建并注册
+                let newRoot = autoRoot(for: root, manifestHome: manifestHome)
+                try? fm.createDirectory(atPath: newRoot, withIntermediateDirectories: true)
+                let db = (wbDir() as NSString).appendingPathComponent("workbuddy.db")
+                if fm.fileExists(atPath: db) {
+                    let eo = sqlEsc(newRoot)
+                    try? run("/usr/bin/sqlite3", [db, "INSERT OR IGNORE INTO workspaces(path, last_opened_at) VALUES('\(eo)', strftime('%s','now')*1000);"])
+                }
+                log("项目空间未选目标目录，已自动创建并注册: \(newRoot)")
+                let entryName = (item.realPath as NSString).lastPathComponent
+                dst = (newRoot as NSString).appendingPathComponent(entryName)
             } else {
                 dst = item.realPath
             }
@@ -448,33 +837,48 @@ final class BackupEngine {
             dst = resolveDst(item)
         }
 
-        // 工作区类（记忆/Skill）：目标工作区不存在 → 兜底归档到用户级 workspace_memory_archive，不丢弃
+        // 工作区类（记忆/Skill）：目标工作区不存在
         if item.category == "workspaceMemory" || item.category == "workspaceSkills" {
-            let wsRoot = (dst as NSString).deletingLastPathComponent   // .../.workbuddy
-            let wsGrand = (wsRoot as NSString).deletingLastPathComponent // 工作区路径
-            if !fm.fileExists(atPath: wsGrand) {
-                let arcName = safeName(wsGrand)
-                let sub = item.category == "workspaceMemory" ? "memory" : "skills"
-                let arcDst = (self.wbDir() as NSString)
-                    .appendingPathComponent("workspace_memory_archive/\(arcName)/\(sub)")
-                // 已有归档先备份，避免覆盖丢失
-                if self.fm.fileExists(atPath: arcDst) {
-                    let bk = (backupRoot as NSString)
-                        .appendingPathComponent("archive_\(safeName(arcDst))")
-                    try? self.fm.createDirectory(atPath: (bk as NSString).deletingLastPathComponent,
+            let oldWsRoot = item.workspaceRoot
+                ?? (((dst as NSString).deletingLastPathComponent) as NSString).deletingLastPathComponent
+            if !fm.fileExists(atPath: oldWsRoot) {
+                if importOptions.archiveMissingWorkspaces {
+                    // 归档模式：兜底到用户级 workspace_memory_archive，不丢弃
+                    let arcName = safeName(oldWsRoot)
+                    let sub = item.category == "workspaceMemory" ? "memory" : "skills"
+                    let arcDst = (self.wbDir() as NSString)
+                        .appendingPathComponent("workspace_memory_archive/\(arcName)/\(sub)")
+                    if self.fm.fileExists(atPath: arcDst) {
+                        let bk = (backupRoot as NSString)
+                            .appendingPathComponent("archive_\(safeName(arcDst))")
+                        try? self.fm.createDirectory(atPath: (bk as NSString).deletingLastPathComponent,
+                                                     withIntermediateDirectories: true)
+                        try? self.fm.removeItemIfExists(atPath: bk)
+                        try? self.fm.moveItem(atPath: arcDst, toPath: bk)
+                    }
+                    try? self.fm.createDirectory(atPath: (arcDst as NSString).deletingLastPathComponent,
                                                  withIntermediateDirectories: true)
-                    try? self.fm.removeItemIfExists(atPath: bk)
-                    try? self.fm.moveItem(atPath: arcDst, toPath: bk)
+                    do {
+                        try self.fm.copyItem(atPath: src, toPath: arcDst)
+                        log("目标工作区不存在，已归档工作区\(item.category)到: \(arcDst)")
+                    } catch {
+                        log("归档失败: \(arcDst) - \(error.localizedDescription)")
+                    }
+                    return
+                } else {
+                    // 默认：按原目录结构自动创建并注册 workspaces 表，让 WorkBuddy 直接认出
+                    let newRoot = autoRoot(for: oldWsRoot, manifestHome: manifestHome)
+                    let wbDir = (newRoot as NSString).appendingPathComponent(".workbuddy")
+                    try? self.fm.createDirectory(atPath: wbDir, withIntermediateDirectories: true)
+                    let sub = item.category == "workspaceMemory" ? "memory" : "skills"
+                    dst = (wbDir as NSString).appendingPathComponent(sub)
+                    let db = (self.wbDir() as NSString).appendingPathComponent("workbuddy.db")
+                    if self.fm.fileExists(atPath: db) {
+                        let eo = sqlEsc(newRoot)
+                        try? self.run("/usr/bin/sqlite3", [db, "INSERT OR IGNORE INTO workspaces(path, last_opened_at) VALUES('\(eo)', strftime('%s','now')*1000);"])
+                    }
+                    log("目标工作区不存在，已自动创建并注册: \(newRoot)（\(item.category) 将还原到该工作区）")
                 }
-                try? self.fm.createDirectory(atPath: (arcDst as NSString).deletingLastPathComponent,
-                                             withIntermediateDirectories: true)
-                do {
-                    try self.fm.copyItem(atPath: src, toPath: arcDst)
-                    log("目标工作区不存在，已归档工作区\(item.category)到: \(arcDst)")
-                } catch {
-                    log("归档失败: \(arcDst) - \(error.localizedDescription)")
-                }
-                return
             }
         }
 

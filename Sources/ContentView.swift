@@ -25,8 +25,23 @@ struct ContentView: View {
     // 导入侧项目空间目标目录映射（旧工作区根 -> 新工作区根）
     @State private var importProjectRoots: [String] = []
     @State private var importTargets: [String: String] = [:]
+    // 导入范围（读取包后显示，只恢复勾中的类别）
+    @State private var importOptMemory = true
+    @State private var importOptConversations = true
+    @State private var importOptSkills = true
+    @State private var importOptProjectSpaces = true
+    @State private var importSummary: [BackupEngine.ImportCategorySummary] = []
+    // 对话自选 + 账号过户
+    @State private var packageConversations: [BackupEngine.PackageConversation] = []
+    @State private var selectedConversationIds: Set<String> = []
+    @State private var manualTargetUserId = ""
+    @State private var showConversationPicker = false
+    @State private var archiveMissing = false   // 目标工作区不存在时归档（默认自动创建）
+    @State private var scanRoots: [String] = []
+    @State private var showScanSettings = false
 
     var body: some View {
+        ScrollView {
         VStack(spacing: 12) {
             Text("WorkBuddy 记忆备份")
                 .font(.title).bold()
@@ -110,10 +125,8 @@ struct ContentView: View {
                             let grouped = Dictionary(grouping: projectOptions, by: { $0.workspace })
                             ForEach(Array(grouped.keys.sorted()), id: \.self) { ws in
                                 VStack(alignment: .leading, spacing: 2) {
-                                    let wsSize = grouped[ws]!.reduce(Int64(0)) { acc, o in
-                                        let on = entryChecked[o.path] ?? !o.excludedByDefault
-                                        return on ? acc + o.size : acc
-                                    }
+                                    // 行大小 = 该工作区可包含条目的固定总大小（默认排除项不计），与当前勾选状态无关
+                                    let wsSize = grouped[ws]!.filter { !$0.excludedByDefault }.reduce(Int64(0)) { $0 + $1.size }
                                     Toggle("📁 \((ws as NSString).lastPathComponent) (\(BackupEngine.shared.fmt(wsSize)))",
                                            isOn: Binding(
                                             get: { workspaceChecked[ws] ?? true },
@@ -187,6 +200,34 @@ struct ContentView: View {
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .windowBackgroundColor)))
             }
 
+            // 扫描设置：挪位工作区的自定义搜索路径
+            DisclosureGroup("扫描设置（工作区挪位后的搜索路径，当前 \(scanRoots.count) 条）", isExpanded: $showScanSettings) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("把项目挪入的「收容所」文件夹加进来，导出/导入时会到这里深度搜索（6 层）。内置已扫 WorkBuddy/Downloads/Desktop/Documents。")
+                        .font(.caption).foregroundColor(.secondary)
+                    ForEach(scanRoots, id: \.self) { r in
+                        HStack {
+                            Text(r).font(.caption).lineLimit(1)
+                            Spacer()
+                            Button("移除") {
+                                scanRoots.removeAll { $0 == r }
+                                BackupEngine.shared.setCustomScanRoots(scanRoots)
+                                reloadProjectOptions()
+                                recomputeSources()
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                    HStack {
+                        Button("添加扫描路径…") { addScanRoot() }
+                            .controlSize(.small)
+                        Text("改动后立即生效").font(.caption2).foregroundColor(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .font(.subheadline)
+
             HStack(spacing: 20) {
                 Button(action: doExport) {
                     Label("导出备份", systemImage: "square.and.arrow.up")
@@ -229,9 +270,135 @@ struct ContentView: View {
                     Text("当前用户目录：\(abbr(NSHomeDirectory()))")
                         .font(.caption).foregroundColor(.secondary)
 
+                    if !importSummary.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("导入范围（可单独勾选）").font(.subheadline).bold()
+                            let hasMemory = importSummary.contains(where: { $0.key == "memory" })
+                            Toggle(isOn: $importOptMemory) {
+                                HStack {
+                                    Text("长期记忆文件")
+                                    if let e = importSummary.first(where: { $0.key == "memory" }) {
+                                        Text("（\(e.count) 项 · \(BackupEngine.shared.fmt(e.size))）")
+                                            .font(.caption).foregroundColor(.secondary)
+                                    } else {
+                                        Text("（本包未含）").font(.caption).foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .disabled(!hasMemory)
+                            .onChange(of: importOptMemory) { _ in recomputeImportPreview() }
+                            let hasConv = importSummary.contains(where: { $0.key == "conversations" })
+                            Toggle(isOn: $importOptConversations) {
+                                HStack {
+                                    Text("对话记忆")
+                                    if let e = importSummary.first(where: { $0.key == "conversations" }) {
+                                        Text("（\(e.count) 项 · \(BackupEngine.shared.fmt(e.size))）")
+                                            .font(.caption).foregroundColor(.secondary)
+                                    } else {
+                                        Text("（本包未含）").font(.caption).foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .disabled(!hasConv)
+                            .onChange(of: importOptConversations) { _ in recomputeImportPreview() }
+                                if !packageConversations.isEmpty {
+                                    HStack(spacing: 8) {
+                                        Button(showConversationPicker ? "收起对话列表" : "选择要恢复的对话（\(selectedConversationIds.count)/\(packageConversations.count)）") {
+                                            showConversationPicker.toggle()
+                                        }
+                                        .controlSize(.small)
+                                        if showConversationPicker {
+                                            Button("全选对话") { selectedConversationIds = Set(packageConversations.map { $0.id }) }
+                                                .controlSize(.small)
+                                            Button("全不选对话") { selectedConversationIds = [] }
+                                                .controlSize(.small)
+                                        }
+                                    }
+                                    if showConversationPicker {
+                                        ScrollView {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                ForEach(packageConversations) { c in
+                                                    Toggle(isOn: Binding(
+                                                        get: { selectedConversationIds.contains(c.id) },
+                                                        set: { nv in
+                                                            if nv { selectedConversationIds.insert(c.id) }
+                                                            else { selectedConversationIds.remove(c.id) }
+                                                        })) {
+                                                        HStack {
+                                                            Text(c.title).lineLimit(1)
+                                                            Text("· \(workspaceName(of: c.cwd))")
+                                                                .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                                                            Spacer()
+                                                            Text(dateStr(c.updatedAt))
+                                                                .font(.caption2).foregroundColor(.secondary)
+                                                        }
+                                                    }
+                                                    .font(.caption)
+                                                }
+                                            }
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                        .frame(maxHeight: 150)
+                                        .padding(6)
+                                        .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
+                                    }
+                                }
+                            let hasSkills = importSummary.contains(where: { $0.key == "skills" })
+                            Toggle(isOn: $importOptSkills) {
+                                HStack {
+                                    Text("全部 Skill")
+                                    if let e = importSummary.first(where: { $0.key == "skills" }) {
+                                        Text("（\(e.count) 项 · \(BackupEngine.shared.fmt(e.size))）")
+                                            .font(.caption).foregroundColor(.secondary)
+                                    } else {
+                                        Text("（本包未含）").font(.caption).foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .disabled(!hasSkills)
+                            .onChange(of: importOptSkills) { _ in recomputeImportPreview() }
+                            let hasPS = importSummary.contains(where: { $0.key == "projectSpaces" })
+                            Toggle(isOn: $importOptProjectSpaces) {
+                                HStack {
+                                    Text("项目空间")
+                                    if let e = importSummary.first(where: { $0.key == "projectSpaces" }) {
+                                        Text("（\(e.count) 项 · \(BackupEngine.shared.fmt(e.size))）")
+                                            .font(.caption).foregroundColor(.secondary)
+                                    } else {
+                                        Text("（本包未含）").font(.caption).foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .disabled(!hasPS)
+                            .onChange(of: importOptProjectSpaces) { _ in recomputeImportPreview() }
+                        }
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .windowBackgroundColor)))
+                    }
+
+                    Toggle("目标工作区不存在时归档到 workspace_memory_archive（默认关闭=按原目录结构自动创建并注册）",
+                           isOn: $archiveMissing)
+                        .font(.caption)
+
+                    if importOptConversations && !packageConversations.isEmpty {
+                        HStack(spacing: 6) {
+                            if let local = BackupEngine.shared.localUserId() {
+                                Text("账号过户：恢复的会话将归属当前账号 \(String(local.prefix(8)))…")
+                                    .font(.caption).foregroundColor(.secondary)
+                            } else {
+                                Text("未探测到本机账号，可手动填写目标账号 id（留空则不改）:")
+                                    .font(.caption).foregroundColor(.orange)
+                                TextField("user_id", text: $manualTargetUserId)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 260)
+                                    .font(.caption)
+                            }
+                        }
+                    }
+
                     if !importProjectRoots.isEmpty {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("项目空间：请为每个工作区选择导入目标目录").bold()
+                            Text("项目空间：可选目标目录（不选则按原目录结构自动创建并注册）").bold()
                             ForEach(importProjectRoots, id: \.self) { root in
                                 HStack {
                                     Text((root as NSString).lastPathComponent).font(.caption).bold()
@@ -240,7 +407,7 @@ struct ContentView: View {
                                         Text("→ \((tgt as NSString).lastPathComponent)")
                                             .font(.caption).foregroundColor(.secondary)
                                     } else {
-                                        Text("（未选择）").font(.caption).foregroundColor(.orange)
+                                        Text("（未选→按原目录结构自动创建）").font(.caption).foregroundColor(.secondary)
                                     }
                                     Button("选择目录") { chooseTarget(for: root) }
                                         .controlSize(.small)
@@ -256,7 +423,7 @@ struct ContentView: View {
                             ForEach(importPreview, id: \.self) { line in
                                 Text(line)
                                     .font(.system(.caption, design: .monospaced))
-                                    .lineLimit(1)
+                                    .fixedSize(horizontal: false, vertical: true)  // 自动换行，完整显示长路径
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -283,10 +450,12 @@ struct ContentView: View {
             .frame(height: 80)
         }
         .padding([.horizontal, .bottom], 16)
+        }
         .frame(minWidth: 880, minHeight: 780)
         .preferredColorScheme(.dark)
         .tint(Color.accentColor)
         .onAppear {
+            scanRoots = BackupEngine.shared.customScanRoots()
             reloadProjectOptions()
             recomputeSources()
         }
@@ -295,6 +464,7 @@ struct ContentView: View {
     // MARK: - 项目空间选择辅助
 
     private func reloadProjectOptions() {
+        // 面板加载时静默探测（避免与导出时的探测日志重复刷屏；导出时才输出一次）
         projectOptions = BackupEngine.shared.projectSpaceOptions()
         for o in projectOptions where entryChecked[o.path] == nil {
             entryChecked[o.path] = !o.excludedByDefault
@@ -429,11 +599,22 @@ struct ContentView: View {
         DispatchQueue.global().async {
             do {
                 let items = try BackupEngine.shared.preview(zip: url.path)
+                let summary = (try? BackupEngine.shared.importSummary(zip: url.path)) ?? []
+                let convs = (try? BackupEngine.shared.conversationsInPackage(zip: url.path)) ?? []
                 let roots = (try? BackupEngine.shared.projectSpaceWorkspaces(from: url.path)) ?? []
                 DispatchQueue.main.async {
                     busy = false
                     importPreview = items
                     importZip = url.path
+                    importSummary = summary
+                    packageConversations = convs
+                    selectedConversationIds = Set(convs.map { $0.id })
+                    showConversationPicker = false
+                    manualTargetUserId = ""
+                    importOptMemory = true
+                    importOptConversations = true
+                    importOptSkills = true
+                    importOptProjectSpaces = true
                     importProjectRoots = roots
                     importTargets = [:]
                     showConfirm = true
@@ -451,6 +632,43 @@ struct ContentView: View {
         }
     }
 
+    private func addScanRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.title = "选择要纳入扫描的文件夹"
+        if panel.runModal() == .OK, let url = panel.url {
+            let path = url.path
+            if !scanRoots.contains(path) {
+                scanRoots.append(path)
+                BackupEngine.shared.setCustomScanRoots(scanRoots)
+                reloadProjectOptions()
+                recomputeSources()
+                logText += "已添加扫描路径: \(path)\n"
+            }
+        }
+    }
+
+    private func workspaceName(of cwd: String) -> String {
+        cwd.isEmpty ? "（无工作目录）" : (cwd as NSString).lastPathComponent
+    }
+
+    private func dateStr(_ ts: Int64) -> String {
+        guard ts > 0 else { return "" }
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(ts) / 1000.0))
+    }
+
+    private func recomputeImportPreview() {
+        guard let zip = importZip else { return }
+        let opts = BackupEngine.ImportOptions(
+            memory: importOptMemory, conversations: importOptConversations,
+            skills: importOptSkills, projectSpaces: importOptProjectSpaces)
+        importPreview = (try? BackupEngine.shared.preview(zip: zip, options: opts)) ?? []
+    }
+
     private func chooseTarget(for root: String) {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -465,9 +683,12 @@ struct ContentView: View {
 
     private func confirmImport() {
         guard let zip = importZip else { return }
-        if !importProjectRoots.isEmpty && importTargets.count < importProjectRoots.count {
-            logText += "⚠️ 请先为每个项目空间工作区选择目标目录。\n"
-            return
+        // 未选目标目录的工作区将自动落位（原路径存在→原位；不存在→自动创建 ~/WorkBuddy/<名> 并注册）
+        if !importProjectRoots.isEmpty {
+            let missing = importProjectRoots.filter { importTargets[$0] == nil }
+            if !missing.isEmpty {
+                logText += "未选目标目录的工作区 \(missing.count) 个，将按原目录结构自动落位。\n"
+            }
         }
         busy = true
         progress = 0
@@ -475,16 +696,32 @@ struct ContentView: View {
         DispatchQueue.main.async { logText += "开始导入...\n" }
         DispatchQueue.global().async {
             do {
+                var opts = BackupEngine.ImportOptions(
+                    memory: importOptMemory, conversations: importOptConversations,
+                    skills: importOptSkills, projectSpaces: importOptProjectSpaces)
+                if importOptConversations && !packageConversations.isEmpty {
+                    opts.selectedSessions = selectedConversationIds
+                }
+                if importOptConversations && !manualTargetUserId.trimmingCharacters(in: .whitespaces).isEmpty {
+                    opts.targetUserId = manualTargetUserId.trimmingCharacters(in: .whitespaces)
+                }
+                opts.archiveMissingWorkspaces = archiveMissing
                 try BackupEngine.shared.importBackup(
                     from: zip,
                     log: { line in DispatchQueue.main.async { logText += line + "\n" } },
                     progress: { p, phase in DispatchQueue.main.async { progress = p; progressPhase = phase } },
-                    projectTargets: importTargets
+                    projectTargets: importTargets,
+                    importOptions: opts
                 )
                 DispatchQueue.main.async {
                     busy = false
                     importPreview = []
                     importZip = nil
+                    importSummary = []
+                    packageConversations = []
+                    selectedConversationIds = []
+                    manualTargetUserId = ""
+                    showConversationPicker = false
                     importProjectRoots = []
                     importTargets = [:]
                     showConfirm = false

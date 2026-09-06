@@ -149,8 +149,7 @@ struct ContentView: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     // 行大小 = 该工作区可包含条目的固定总大小（默认排除项不计），与当前勾选状态无关
                                     let wsSize = grouped[ws]!.filter { !$0.excludedByDefault }.reduce(Int64(0)) { $0 + $1.size }
-                                    Toggle("📁 \((ws as NSString).lastPathComponent) (\(projectSizesDone ? BackupEngine.shared.fmt(wsSize) : "…"))",
-                                           isOn: Binding(
+                                    Toggle(isOn: Binding(
                                             get: { workspaceChecked[ws] ?? true },
                                             set: { nv in
                                                 workspaceChecked[ws] = nv
@@ -158,12 +157,24 @@ struct ContentView: View {
                                                     entryChecked[opt.path] = nv
                                                 }
                                                 recomputeSources()
-                                            }))
+                                            })) {
+                                        HStack(spacing: 5) {
+                                            Text("📁 \((ws as NSString).lastPathComponent) (\(projectSizesDone ? BackupEngine.shared.fmt(wsSize) : "…"))")
+                                            if let reg = grouped[ws]!.first?.registeredRoot {
+                                                Text("已迁移 ↗")
+                                                    .font(.caption2).fontWeight(.medium)
+                                                    .foregroundColor(.orange)
+                                                    .padding(.horizontal, 5).padding(.vertical, 1)
+                                                    .background(Capsule().fill(Color.orange.opacity(0.15)))
+                                                    .help("SpaceMover 已迁移（反向软链）\n原位置: \(reg)\n现位置: \(ws)\n导入时将按原位置结构自动还原")
+                                            }
+                                        }
+                                    }
                                     .font(.subheadline)
                                     .padding(.bottom, 2)
                                     if projectShowSubentries {
                                         ForEach(grouped[ws]!.sorted(by: { $0.name < $1.name })) { opt in
-                                        Toggle("   \(opt.isDir ? "📂" : "📄") \(opt.name)  (\(projectSizesDone || opt.size > 0 ? BackupEngine.shared.fmt(opt.size) : "…"))",
+                                        Toggle("   \(opt.isDir ? "📂" : "📄") \(opt.name)\(opt.isSymlink ? " 🔗" : "")  (\(projectSizesDone || opt.size > 0 ? BackupEngine.shared.fmt(opt.size) : "…"))",
                                                isOn: Binding(
                                                 get: { entryChecked[opt.path] ?? !opt.excludedByDefault },
                                                 set: { nv in
@@ -178,6 +189,7 @@ struct ContentView: View {
                                                 }))
                                             .font(.caption)
                                             .foregroundColor(opt.excludedByDefault ? .secondary : .primary)
+                                            .help(opt.isSymlink ? "🔗 该子项目为软链（SpaceMover 单项目迁移），数据在链接目标" : "")
                                         }
                                     }
                                 }

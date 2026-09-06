@@ -11,6 +11,13 @@ struct ExportItem: Codable, Identifiable {
     let homeRel: String?   // 相对家目录的路径（用户级条目用，导入时按当前家目录解析）
     let size: Int64
     let workspaceRoot: String?   // 原始工作区绝对路径（projectSpace 导入重映射用）
+    let registeredRoot: String?  // SpaceMover 迁移工作区的原登记路径（语义根，导入落位优先用）
+}
+
+/// SpaceMover 式迁移的工作区映射（随 manifest 进导出包）
+struct MigratedWorkspace: Codable {
+    let registered: String   // 原登记路径（导出机器上的软链位置，用户心智位置）
+    let effective: String    // 真实数据位置
 }
 
 struct Manifest: Codable {
@@ -18,12 +25,15 @@ struct Manifest: Codable {
     let createdAt: String
     let items: [ExportItem]
     let homeDir: String?   // 导出机器的家目录（用于导入时按原目录结构重建）
+    let migratedWorkspaces: [MigratedWorkspace]?   // SpaceMover 式迁移映射（老包无此字段，decodeIfPresent 兼容）
 
-    init(appVersion: String, createdAt: String, items: [ExportItem], homeDir: String?) {
+    init(appVersion: String, createdAt: String, items: [ExportItem], homeDir: String?,
+         migratedWorkspaces: [MigratedWorkspace]? = nil) {
         self.appVersion = appVersion
         self.createdAt = createdAt
         self.items = items
         self.homeDir = homeDir
+        self.migratedWorkspaces = migratedWorkspaces
     }
 
     init(from decoder: Decoder) throws {
@@ -32,10 +42,11 @@ struct Manifest: Codable {
         createdAt = try c.decode(String.self, forKey: .createdAt)
         items = try c.decode([ExportItem].self, forKey: .items)
         homeDir = try c.decodeIfPresent(String.self, forKey: .homeDir)
+        migratedWorkspaces = try c.decodeIfPresent([MigratedWorkspace].self, forKey: .migratedWorkspaces)
     }
 
     enum CodingKeys: String, CodingKey {
-        case appVersion, createdAt, items, homeDir
+        case appVersion, createdAt, items, homeDir, migratedWorkspaces
     }
 }
 
@@ -67,6 +78,8 @@ struct WorkspaceEntryOption: Identifiable {
     let isDir: Bool
     var size: Int64          // 懒加载：先 0，后台逐个回填
     let excludedByDefault: Bool
+    let registeredRoot: String?   // 非 nil = 该工作区被 SpaceMover 迁移过（UI 显示「已迁移」徽标）
+    let isSymlink: Bool           // 子目录本身是软链（SpaceMover 单项目迁移）
     var id: String { path }
 }
 
@@ -165,10 +178,19 @@ final class BackupEngine {
             .filter { !$0.isEmpty }
     }
 
+    /// effective(真实位置) -> registered(原软链位置) 反查表（仅含 SpaceMover 迁移过的工作区）
+    private func migrationMap(_ resolved: [ResolvedWorkspace]) -> [String: String] {
+        Dictionary(resolved.filter { $0.isSymlinkMigration }.map { ($0.effective, $0.registered) },
+                   uniquingKeysWith: { a, _ in a })
+    }
+
     /// 快速枚举：只列名字与排除态，不算大小（首屏秒出，大小由 UI 后台逐个回填）
     func projectSpaceOptionsFast(log: ((String) -> Void)? = nil) -> [WorkspaceEntryOption] {
         var out: [WorkspaceEntryOption] = []
-        for wp in resolveWorkspacesDetailed(log: log).map({ $0.effective }) {
+        let resolved = resolveWorkspacesDetailed(log: log)
+        for rw in resolved {
+            let wp = rw.effective
+            let reg = rw.isSymlinkMigration ? rw.registered : nil
             guard let urls = try? fm.contentsOfDirectory(at: URL(fileURLWithPath: wp),
                            includingPropertiesForKeys: [.isDirectoryKey]) else { continue }
             for u in urls {
@@ -176,7 +198,8 @@ final class BackupEngine {
                 let isDir = (try? u.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
                 out.append(WorkspaceEntryOption(workspace: wp, name: name, path: u.path,
                                                 isDir: isDir, size: 0,
-                                                excludedByDefault: defaultProjectExcludes.contains(name)))
+                                                excludedByDefault: defaultProjectExcludes.contains(name),
+                                                registeredRoot: reg, isSymlink: isSymlinkPath(u.path)))
             }
         }
         return out
@@ -185,7 +208,10 @@ final class BackupEngine {
     /// 完整枚举（含递归算大小，较慢；保留给需要一次性全量的调用方）
     func projectSpaceOptions(log: ((String) -> Void)? = nil) -> [WorkspaceEntryOption] {
         var out: [WorkspaceEntryOption] = []
-        for wp in resolveWorkspacesDetailed(log: log).map({ $0.effective }) {
+        let resolved = resolveWorkspacesDetailed(log: log)
+        for rw in resolved {
+            let wp = rw.effective
+            let reg = rw.isSymlinkMigration ? rw.registered : nil
             guard let urls = try? fm.contentsOfDirectory(at: URL(fileURLWithPath: wp),
                            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey]) else { continue }
             for u in urls {
@@ -194,7 +220,8 @@ final class BackupEngine {
                 let sz = self.sizeOf(u.path)
                 out.append(WorkspaceEntryOption(workspace: wp, name: name, path: u.path,
                                                 isDir: isDir, size: sz,
-                                                excludedByDefault: defaultProjectExcludes.contains(name)))
+                                                excludedByDefault: defaultProjectExcludes.contains(name),
+                                                registeredRoot: reg, isSymlink: isSymlinkPath(u.path)))
             }
         }
         return out
@@ -259,7 +286,7 @@ final class BackupEngine {
         let wb = wbDir()
 
         // 构造待收集任务清单（按勾选范围过滤，可计数，便于进度条）
-        struct ColTask { let src: String; let cat: String; let rel: String; var workspaceRoot: String? = nil }
+        struct ColTask { let src: String; let cat: String; let rel: String; var workspaceRoot: String? = nil; var registeredRoot: String? = nil }
         var tasks: [ColTask] = []
         if options.longTermMemory {
             tasks.append(ColTask(src: (wb as NSString).appendingPathComponent("MEMORY.md"),
@@ -282,24 +309,33 @@ final class BackupEngine {
         let resolvedWS = resolveWorkspacesDetailed(log: log)
         for rw in resolvedWS {
             let wp = rw.effective
+            let reg = rw.isSymlinkMigration ? rw.registered : nil
             let key = safeName(wp)
             if options.longTermMemory {
                 tasks.append(ColTask(src: (wp as NSString).appendingPathComponent(".workbuddy/memory"),
-                                     cat: "workspaceMemory", rel: "workspaces/\(key)/memory", workspaceRoot: wp))
+                                     cat: "workspaceMemory", rel: "workspaces/\(key)/memory",
+                                     workspaceRoot: wp, registeredRoot: reg))
             }
             if options.skills {
                 tasks.append(ColTask(src: (wp as NSString).appendingPathComponent(".workbuddy/skills"),
-                                     cat: "workspaceSkills", rel: "workspaces/\(key)/skills", workspaceRoot: wp))
+                                     cat: "workspaceSkills", rel: "workspaces/\(key)/skills",
+                                     workspaceRoot: wp, registeredRoot: reg))
             }
         }
         // 项目空间：仅收集用户勾选的工作区顶层条目
         if options.projectSpaces {
+            // UI 勾选的 key 是 effective（真实位置）；兼容直接传 registered（原软链位置）的情况
+            var regLookup = migrationMap(resolvedWS)
+            for rw in resolvedWS where rw.isSymlinkMigration {
+                regLookup[rw.registered] = rw.registered
+            }
             for (ws, entryNames) in options.projectSelection.entries {
                 let key = safeName(ws)
                 for name in entryNames {
                     let src = (ws as NSString).appendingPathComponent(name)
                     let rel = "workspaces/\(key)/\(name)"
-                    tasks.append(ColTask(src: src, cat: "projectSpace", rel: rel, workspaceRoot: ws))
+                    tasks.append(ColTask(src: src, cat: "projectSpace", rel: rel,
+                                         workspaceRoot: ws, registeredRoot: regLookup[ws]))
                 }
             }
         }
@@ -323,7 +359,8 @@ final class BackupEngine {
                 ? (t.src.hasPrefix(prefix) ? String(t.src.dropFirst(prefix.count)) : nil)
                 : nil
             items.append(ExportItem(category: t.cat, realPath: t.src, bundleRel: t.rel,
-                                    homeRel: computedHomeRel, size: sz, workspaceRoot: t.workspaceRoot))
+                                    homeRel: computedHomeRel, size: sz, workspaceRoot: t.workspaceRoot,
+                                    registeredRoot: t.registeredRoot))
             log("已收集 \(t.cat)：\(t.src) (\(self.fmt(sz)))")
             progress(0.6 * Double(i + 1) / n, "正在收集文件…")
         }
@@ -343,16 +380,25 @@ final class BackupEngine {
                                         realPath: dbSrc,
                                         bundleRel: "conversations/workbuddy.db",
                                         homeRel: dbHomeRel,
-                                        size: sz, workspaceRoot: nil))
+                                        size: sz, workspaceRoot: nil,
+                                        registeredRoot: nil))
                 log("已快照对话库 conversations/workbuddy.db (\(fmt(sz)))")
             }
         }
         progress(0.7, "正在写入清单…")
 
-        // 清单
+        // 清单（含 SpaceMover 迁移映射，供导入侧按原登记路径落位）
+        let migrated = resolvedWS.filter { $0.isSymlinkMigration }
+            .map { MigratedWorkspace(registered: $0.registered, effective: $0.effective) }
         let manifest = Manifest(appVersion: version,
                                 createdAt: ISO8601DateFormatter().string(from: Date()),
-                                items: items, homeDir: homeDir())
+                                items: items, homeDir: homeDir(),
+                                migratedWorkspaces: migrated.isEmpty ? nil : migrated)
+        if !migrated.isEmpty {
+            for m in migrated {
+                log("已记录迁移映射进导出包: \(m.registered) → \(m.effective)")
+            }
+        }
         let mdata = try JSONEncoder().encode(manifest)
         try mdata.write(to: URL(fileURLWithPath:
             (staging as NSString).appendingPathComponent("manifest.json")))
@@ -533,7 +579,8 @@ final class BackupEngine {
                         dst = (nr as NSString).appendingPathComponent(entryName)
                         note = "已选目标目录"
                     } else if !fm.fileExists(atPath: root) {
-                        let ar = autoRoot(for: root, manifestHome: m.homeDir)
+                        // 原真实位置本机不存在 → 优先按原登记路径（SpaceMover 迁移语义根）还原结构
+                        let ar = autoRoot(for: item.registeredRoot ?? root, manifestHome: m.homeDir)
                         // realPath 已含条目名，只替换工作区根部分
                         let entryName = (item.realPath as NSString).lastPathComponent
                         dst = (ar as NSString).appendingPathComponent(entryName)
@@ -550,7 +597,7 @@ final class BackupEngine {
                     ?? (((dst as NSString).deletingLastPathComponent) as NSString).deletingLastPathComponent
                 if !fm.fileExists(atPath: oldWsRoot) {
                     let sub = item.category == "workspaceMemory" ? "memory" : "skills"
-                    let newRoot = autoRoot(for: oldWsRoot, manifestHome: m.homeDir)
+                    let newRoot = autoRoot(for: item.registeredRoot ?? oldWsRoot, manifestHome: m.homeDir)
                     dst = (newRoot as NSString).appendingPathComponent(".workbuddy/\(sub)")
                     note = "  ⚠️ 目标工作区不存在→自动创建并注册: \(newRoot)"
                 }
@@ -807,7 +854,8 @@ final class BackupEngine {
                 var note = "未选目录→自动落位"
                 var dst = item.realPath
                 if let root = item.workspaceRoot, !fm.fileExists(atPath: root) {
-                    let ar = autoRoot(for: root, manifestHome: m.homeDir)
+                    // 原真实位置本机不存在 → 优先按原登记路径（SpaceMover 迁移语义根）还原结构
+                    let ar = autoRoot(for: item.registeredRoot ?? root, manifestHome: m.homeDir)
                     let entryName = (item.realPath as NSString).lastPathComponent
                     dst = (ar as NSString).appendingPathComponent(entryName)
                     note = "原路径不存在→自动创建并注册: \(ar)"
@@ -822,7 +870,7 @@ final class BackupEngine {
                     ?? (((dst as NSString).deletingLastPathComponent) as NSString).deletingLastPathComponent
                 if !fm.fileExists(atPath: oldWsRoot) {
                     let sub = item.category == "workspaceMemory" ? "memory" : "skills"
-                    let newRoot = autoRoot(for: oldWsRoot, manifestHome: m.homeDir)
+                    let newRoot = autoRoot(for: item.registeredRoot ?? oldWsRoot, manifestHome: m.homeDir)
                     dst = (newRoot as NSString).appendingPathComponent(".workbuddy/\(sub)")
                     note = "  ⚠️ 目标工作区不存在→自动创建并注册: \(newRoot)"
                 }
@@ -991,8 +1039,8 @@ final class BackupEngine {
                 let entryName = (item.realPath as NSString).lastPathComponent
                 dst = (nr as NSString).appendingPathComponent(entryName)
             } else if let root = item.workspaceRoot, !fm.fileExists(atPath: root) {
-                // 未选目标目录且原路径本机不存在 → 按原目录结构自动创建并注册
-                let newRoot = autoRoot(for: root, manifestHome: manifestHome)
+                // 未选目标目录且原路径本机不存在 → 按原登记路径（SpaceMover 迁移语义根）还原目录结构并注册
+                let newRoot = autoRoot(for: item.registeredRoot ?? root, manifestHome: manifestHome)
                 try? fm.createDirectory(atPath: newRoot, withIntermediateDirectories: true)
                 let db = (wbDir() as NSString).appendingPathComponent("workbuddy.db")
                 if fm.fileExists(atPath: db) {
@@ -1038,8 +1086,8 @@ final class BackupEngine {
                     }
                     return
                 } else {
-                    // 默认：按原目录结构自动创建并注册 workspaces 表，让 WorkBuddy 直接认出
-                    let newRoot = autoRoot(for: oldWsRoot, manifestHome: manifestHome)
+                    // 默认：按原登记路径（SpaceMover 迁移语义根优先）还原目录结构并注册 workspaces 表，让 WorkBuddy 直接认出
+                    let newRoot = autoRoot(for: item.registeredRoot ?? oldWsRoot, manifestHome: manifestHome)
                     let wbDir = (newRoot as NSString).appendingPathComponent(".workbuddy")
                     try? self.fm.createDirectory(atPath: wbDir, withIntermediateDirectories: true)
                     let sub = item.category == "workspaceMemory" ? "memory" : "skills"

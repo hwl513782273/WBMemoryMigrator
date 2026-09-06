@@ -21,7 +21,7 @@ struct ContentView: View {
     @State private var projectOptions: [WorkspaceEntryOption] = []
     @State private var entryChecked: [String: Bool] = [:]   // 顶层条目路径 -> 是否勾选
     @State private var workspaceChecked: [String: Bool] = [:] // 工作区根路径 -> 是否勾选
-    @State private var projectShowSubentries = true           // 面板显示模式：true=工作区+子目录，false=只显示工作区
+    @State private var projectShowSubentries = false          // 面板显示模式：true=工作区+子目录，false=只显示工作区（默认）
     // 导入侧项目空间目标目录映射（旧工作区根 -> 新工作区根）
     @State private var importProjectRoots: [String] = []
     @State private var importTargets: [String: String] = [:]
@@ -145,44 +145,62 @@ struct ContentView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
                             let grouped = Dictionary(grouping: projectOptions, by: { $0.workspace })
-                            ForEach(Array(grouped.keys.sorted()), id: \.self) { ws in
+                                .sorted { (a, b) in
+                                    let sa = a.value.filter { !$0.excludedByDefault }.reduce(Int64(0)) { $0 + $1.size }
+                                    let sb = b.value.filter { !$0.excludedByDefault }.reduce(Int64(0)) { $0 + $1.size }
+                                    return sa != sb ? sa > sb : a.key < b.key   // 按大小降序；并列按名字稳定排
+                                }
+                            ForEach(grouped, id: \.key) { pair in
+                                let ws = pair.key
+                                let wsOpts = pair.value
                                 VStack(alignment: .leading, spacing: 2) {
                                     // 行大小 = 该工作区可包含条目的固定总大小（默认排除项不计），与当前勾选状态无关
-                                    let wsSize = grouped[ws]!.filter { !$0.excludedByDefault }.reduce(Int64(0)) { $0 + $1.size }
-                                    Toggle(isOn: Binding(
-                                            get: { workspaceChecked[ws] ?? true },
-                                            set: { nv in
-                                                workspaceChecked[ws] = nv
-                                                for opt in grouped[ws]! {
-                                                    entryChecked[opt.path] = nv
+                                    let wsSize = wsOpts.filter { !$0.excludedByDefault }.reduce(Int64(0)) { $0 + $1.size }
+                                    HStack(alignment: .firstTextBaseline) {
+                                        Toggle(isOn: Binding(
+                                                get: { workspaceChecked[ws] ?? true },
+                                                set: { nv in
+                                                    workspaceChecked[ws] = nv
+                                                    for opt in wsOpts {
+                                                        entryChecked[opt.path] = nv
+                                                    }
+                                                    recomputeSources()
+                                                })) {
+                                            HStack(spacing: 5) {
+                                                Text("📁 \((ws as NSString).lastPathComponent) (\(projectSizesDone ? BackupEngine.shared.fmt(wsSize) : "…"))")
+                                                if let reg = wsOpts.first?.registeredRoot {
+                                                    Text("已迁移 ↗")
+                                                        .font(.caption2).fontWeight(.medium)
+                                                        .foregroundColor(.orange)
+                                                        .padding(.horizontal, 5).padding(.vertical, 1)
+                                                        .background(Capsule().fill(Color.orange.opacity(0.15)))
+                                                        .help("SpaceMover 已迁移（反向软链）\n原位置: \(reg)\n现位置: \(ws)\n导入时将按原位置结构自动还原")
                                                 }
-                                                recomputeSources()
-                                            })) {
-                                        HStack(spacing: 5) {
-                                            Text("📁 \((ws as NSString).lastPathComponent) (\(projectSizesDone ? BackupEngine.shared.fmt(wsSize) : "…"))")
-                                            if let reg = grouped[ws]!.first?.registeredRoot {
-                                                Text("已迁移 ↗")
-                                                    .font(.caption2).fontWeight(.medium)
-                                                    .foregroundColor(.orange)
-                                                    .padding(.horizontal, 5).padding(.vertical, 1)
-                                                    .background(Capsule().fill(Color.orange.opacity(0.15)))
-                                                    .help("SpaceMover 已迁移（反向软链）\n原位置: \(reg)\n现位置: \(ws)\n导入时将按原位置结构自动还原")
                                             }
                                         }
+                                        .font(.subheadline)
+                                        Spacer()
+                                        Button {
+                                            NSWorkspace.shared.open(URL(fileURLWithPath: ws))
+                                        } label: {
+                                            Label("打开", systemImage: "arrow.up.forward.folder")
+                                                .labelStyle(.titleAndIcon)
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .controlSize(.small)
+                                        .help("在访达中打开该工作区文件夹：\(ws)")
                                     }
-                                    .font(.subheadline)
                                     .padding(.bottom, 2)
                                     if projectShowSubentries {
-                                        ForEach(grouped[ws]!.sorted(by: { $0.name < $1.name })) { opt in
+                                        ForEach(wsOpts.sorted(by: { $0.name < $1.name })) { opt in
                                         Toggle("   \(opt.isDir ? "📂" : "📄") \(opt.name)\(opt.isSymlink ? " 🔗" : "")  (\(projectSizesDone || opt.size > 0 ? BackupEngine.shared.fmt(opt.size) : "…"))",
                                                isOn: Binding(
                                                 get: { entryChecked[opt.path] ?? !opt.excludedByDefault },
                                                 set: { nv in
                                                     entryChecked[opt.path] = nv
                                                     // 联动工作区总开关：全部子项都取消则关，全部选中则开，否则保持
-                                                    let opts = grouped[ws]!
-                                                    let allOff = opts.allSatisfy { entryChecked[$0.path] == false || (entryChecked[$0.path] == nil && $0.excludedByDefault) }
-                                                    let allOn = opts.allSatisfy { entryChecked[$0.path] == true || (entryChecked[$0.path] == nil && !$0.excludedByDefault) }
+                                                    let allOff = wsOpts.allSatisfy { entryChecked[$0.path] == false || (entryChecked[$0.path] == nil && $0.excludedByDefault) }
+                                                    let allOn = wsOpts.allSatisfy { entryChecked[$0.path] == true || (entryChecked[$0.path] == nil && !$0.excludedByDefault) }
                                                     if allOff { workspaceChecked[ws] = false }
                                                     else if allOn { workspaceChecked[ws] = true }
                                                     recomputeSources()

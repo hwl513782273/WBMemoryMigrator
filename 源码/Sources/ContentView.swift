@@ -40,6 +40,7 @@ struct ContentView: View {
     @State private var conflictPolicy: BackupEngine.ConflictPolicy = .alwaysOverwrite
     @State private var scanRoots: [String] = []
     @State private var showScanSettings = false
+    @State private var syncRegistry = true   // 导出后同步修正已迁移/挪位工作区的注册路径
     @State private var detectedUserId: String?   // 本机当前账号 id（导入读取包时缓存，避免每帧跑 sqlite）
     private final class GenBox { var value = 0 }
     @State private var sourcesGen = GenBox()     // 后台统计的代数校验（防乱序回写）
@@ -101,6 +102,10 @@ struct ContentView: View {
                     }
                 }
                 .onChange(of: optProjectSpaces) { _ in recomputeSources() }
+                Divider().padding(.vertical, 2)
+                Toggle("同步修正 WorkBuddy 注册路径（已迁移/挪位的工作区按真实位置回写，反向软链保留）",
+                       isOn: $syncRegistry)
+                    .font(.caption)
             }
             .padding(10)
             .cardBackground()
@@ -618,7 +623,7 @@ struct ContentView: View {
         let sel = currentSelection()
         let opts = ExportOptions(longTermMemory: optMemory, conversations: optConversations,
                                  skills: optSkills, projectSpaces: optProjectSpaces,
-                                 projectSelection: sel)
+                                 projectSelection: sel, syncWorkspaceRegistry: syncRegistry)
         let hasProject = opts.projectSpaces && !opts.projectSelection.isEmpty
         guard opts.longTermMemory || opts.conversations || opts.skills || hasProject else {
             logText += "⚠️ 请至少勾选一类数据（项目空间需勾选至少一个子目录）再导出。\n"

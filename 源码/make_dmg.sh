@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 APP="build/WBMemoryMigrator.app"
 VOL="WBMemoryMigrator"
-DMG="build/12-WBMemoryMigrator-1.1_b38-beta-universal.dmg"
+DMG="build/12-WBMemoryMigrator-1.2-universal.dmg"
 STAGING="dmg_staging"
 
 mkdir -p build

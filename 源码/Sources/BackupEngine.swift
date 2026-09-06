@@ -52,9 +52,11 @@ struct ExportOptions {
     var skills: Bool           // 全部 Skill（用户级 + 工作区）
     var projectSpaces: Bool    // 项目空间（指定工作区的源码本体）
     var projectSelection: ProjectSpaceSelection
+    var syncWorkspaceRegistry: Bool = true  // 导出后把已迁移/挪位工作区的注册路径同步修正到真实位置
     static let all = ExportOptions(longTermMemory: true, conversations: true, skills: true,
                                    projectSpaces: false,
-                                   projectSelection: ProjectSpaceSelection(entries: [:]))
+                                   projectSelection: ProjectSpaceSelection(entries: [:]),
+                                   syncWorkspaceRegistry: true)
 }
 
 /// UI 用的项目空间条目选项
@@ -166,7 +168,7 @@ final class BackupEngine {
     /// 快速枚举：只列名字与排除态，不算大小（首屏秒出，大小由 UI 后台逐个回填）
     func projectSpaceOptionsFast(log: ((String) -> Void)? = nil) -> [WorkspaceEntryOption] {
         var out: [WorkspaceEntryOption] = []
-        for wp in resolveWorkspaces(log: log) {
+        for wp in resolveWorkspacesDetailed(log: log).map({ $0.effective }) {
             guard let urls = try? fm.contentsOfDirectory(at: URL(fileURLWithPath: wp),
                            includingPropertiesForKeys: [.isDirectoryKey]) else { continue }
             for u in urls {
@@ -183,7 +185,7 @@ final class BackupEngine {
     /// 完整枚举（含递归算大小，较慢；保留给需要一次性全量的调用方）
     func projectSpaceOptions(log: ((String) -> Void)? = nil) -> [WorkspaceEntryOption] {
         var out: [WorkspaceEntryOption] = []
-        for wp in resolveWorkspaces(log: log) {
+        for wp in resolveWorkspacesDetailed(log: log).map({ $0.effective }) {
             guard let urls = try? fm.contentsOfDirectory(at: URL(fileURLWithPath: wp),
                            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey]) else { continue }
             for u in urls {
@@ -277,7 +279,9 @@ final class BackupEngine {
             tasks.append(ColTask(src: (wb as NSString).appendingPathComponent("skills"),
                                  cat: "userSkills", rel: "skills"))
         }
-        for wp in resolveWorkspaces(log: log) {
+        let resolvedWS = resolveWorkspacesDetailed(log: log)
+        for rw in resolvedWS {
+            let wp = rw.effective
             let key = safeName(wp)
             if options.longTermMemory {
                 tasks.append(ColTask(src: (wp as NSString).appendingPathComponent(".workbuddy/memory"),
@@ -387,6 +391,25 @@ final class BackupEngine {
         progress(1.0, "完成")
         log("打包完成：\(zipPath)  共 \(items.count) 项")
         try? fm.removeItem(atPath: staging)
+
+        // 导出后：把已迁移/挪位工作区的注册路径同步修正到真实位置（反向软链保留，兜底不破坏）
+        if options.syncWorkspaceRegistry {
+            let db = (wbDir() as NSString).appendingPathComponent("workbuddy.db")
+            if fm.fileExists(atPath: db) {
+                var fixed = 0
+                for rw in resolvedWS where rw.effective != rw.registered {
+                    let eo = sqlEsc(rw.registered), en = sqlEsc(rw.effective)
+                    try? run("/usr/bin/sqlite3", [db, "DELETE FROM workspaces WHERE path='\(en)' AND path <> '\(eo)';"])
+                    try? run("/usr/bin/sqlite3", [db, "UPDATE workspaces SET path='\(en)' WHERE path='\(eo)';"])
+                    try? run("/usr/bin/sqlite3", [db, "INSERT OR IGNORE INTO workspaces(path, last_opened_at) VALUES('\(en)', strftime('%s','now')*1000);"])
+                    fixed += 1
+                    log("已同步修正 WorkBuddy 注册路径: \(rw.registered) → \(rw.effective)\(rw.isSymlinkMigration ? "（反向软链保留，兜底不破坏）" : "")")
+                }
+                if fixed > 0 {
+                    log("共修正 \(fixed) 个工作区的注册路径（WorkBuddy 重新打开即认新位置）")
+                }
+            }
+        }
     }
 
     // MARK: 导入范围过滤
@@ -600,15 +623,37 @@ final class BackupEngine {
         return Int(sqliteOut(db, "SELECT count(*) FROM sessions;").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
     }
 
-    /// 导出侧：把 workspaces 表登记的失效路径自动探测到挪位后的新位置
-    func resolveWorkspaces(log: ((String) -> Void)? = nil) -> [String] {
-        var out: [String] = []
+    struct ResolvedWorkspace {
+        let registered: String        // workspaces 表登记路径
+        let effective: String         // 实际收集使用的路径
+        let isSymlinkMigration: Bool  // 原位置为反向软链（SpaceMover 式迁移）
+    }
+
+    func isSymlinkPath(_ p: String) -> Bool {
+        guard let rv = try? fm.attributesOfItem(atPath: p)[.type] as? FileAttributeType else { return false }
+        return rv == .typeSymbolicLink
+    }
+
+    /// 导出侧工作区解析：原位 / 反向软链迁移（SpaceMover 式）/ 挪位自动探测，三类判定
+    func resolveWorkspacesDetailed(log: ((String) -> Void)? = nil) -> [ResolvedWorkspace] {
+        var out: [ResolvedWorkspace] = []
         for wp in workspacePaths() {
-            if fm.fileExists(atPath: wp) { out.append(wp); continue }
+            if fm.fileExists(atPath: wp) {
+                if isSymlinkPath(wp) {
+                    // SpaceMover 式迁移：原位置是反向软链，真实数据在链接目标
+                    let real = (try? fm.destinationOfSymbolicLink(atPath: wp)) ?? wp
+                    let effective = fm.fileExists(atPath: real) ? real : wp
+                    out.append(ResolvedWorkspace(registered: wp, effective: effective, isSymlinkMigration: true))
+                    log?("检测到已迁移工作区（反向软链）: 「\((wp as NSString).lastPathComponent)」→ 真实位置 \(effective)（本次按真实位置收集）")
+                } else {
+                    out.append(ResolvedWorkspace(registered: wp, effective: wp, isSymlinkMigration: false))
+                }
+                continue
+            }
             let name = (wp as NSString).lastPathComponent
             let hits = findFolder(named: name)
             if hits.count == 1 {
-                out.append(hits[0])
+                out.append(ResolvedWorkspace(registered: wp, effective: hits[0], isSymlinkMigration: false))
                 log?("已探测到工作区挪位: 「\(name)」\(wp) → \(hits[0])（本次按新位置收集）")
             } else if hits.count > 1 {
                 let cand = hits.prefix(3).joined(separator: "  |  ")
@@ -618,6 +663,10 @@ final class BackupEngine {
             }
         }
         return out
+    }
+
+    func resolveWorkspaces(log: ((String) -> Void)? = nil) -> [String] {
+        resolveWorkspacesDetailed(log: log).map { $0.effective }
     }
 
     /// 工作区缺失时的落位：优先按原 home 相对结构重建（/Users/old/Downloads/X → ~/Downloads/X），

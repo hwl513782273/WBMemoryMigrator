@@ -24,10 +24,16 @@
 - **对话自选 + 账号过户**：导入时可逐条勾选要恢复的对话；恢复的会话自动过户到当前账号（跨账号导入不再「隐身」），并按导入映射自动改写会话工作目录（cwd），失效目录还会按名称自动探测挪位后的新位置。
 - **工作区缺失自动落位**：目标工作区不存在时按**原目录结构**自动创建（如 `~/Downloads/workbuddy 项目/X` 原样重建）并注册进 workspaces 表，WorkBuddy 直接认出；可选改为归档模式。
 - **自定义扫描路径**：把项目挪入的「收容所」文件夹加入扫描设置（深度 6 层），导出/导入自动跟上挪过位置的工作区。
+- **冲突差异预览 + 三档策略**：导入预览逐条标注「新增 / 包内较新 / 本机较新 / 与本机一致」；冲突策略可选「始终覆盖 / 保留较新 / 跳过冲突」，两个备份包含同一项目不再抓瞎。
+- **覆盖警示**：导入对话记忆前弹窗明示「本机 X 条会话将被替换为已勾选的 M 条」，未勾选任何对话时明确警告将清空。
+- **目录合并语义**：目录对目录的还原改为递归合并（逐文件应用冲突策略），本机独有文件绝不会被整目录替换吞掉。
+- **Apple 风格 UI 重设计**：卡片化布局、图标化区块标题、主次分明按钮、终端风日志，功能零改动。
+- **安全加固**：导入清理范围限定为包内解压文件（本机原有会话文件不再被误删）；高危操作弹窗确认。
+- **性能**：文件统计与全盘扫描挪后台线程（代数校验防乱序），同一个 zip 只解压一次，项目空间首屏秒出、大小懒加载回填。
 - 原生 SwiftUI App，Universal（Apple Silicon + Intel），最低 macOS 12，拖入「应用程序」即用，无依赖脚本。
 
 ### 快速开始
-1. 在 Releases 下载 `12-WBMemoryMigrator-1.1-universal.dmg`。
+1. 在 Releases 下载 `12-WBMemoryMigrator-1.2-universal.dmg`。
 2. 打开 DMG，把 `WBMemoryMigrator.app` 拖入「应用程序」。
 3. 首次打开：右键 → 打开（或终端执行 `xattr -dr com.apple.quarantine /Applications/WBMemoryMigrator.app`）。
 4. 勾选要迁移的数据类别 → 点击「导出」，得到一个 zip 备份包。
@@ -77,10 +83,16 @@ bash make_dmg.sh   # hdiutil 打包 DMG
 - **Conversation picking + account takeover**: tick individual conversations to restore; restored sessions are automatically re-owned to the current account (no more "invisible" imports across accounts), with session working directories (cwd) remapped per import mapping — and moved folders are auto-detected by name.
 - **Auto-create missing workspaces**: recreates the **original directory structure** (e.g. `~/Downloads/workbuddy 项目/X`) and registers it in the workspaces table so WorkBuddy recognizes it immediately; archive mode available as an alternative.
 - **Custom scan roots**: register "relocation vault" folders (scanned 6 levels deep) so export/import automatically follow moved workspaces.
+- **Conflict diff preview + three policies**: import preview marks every entry as "new / newer in package / newer locally / identical"; choose per-import policy: always overwrite / keep newer / skip conflicts.
+- **Overwrite warning**: importing conversations pops a dialog stating "X local sessions will be replaced by the M selected", with an explicit warning when nothing is selected.
+- **Directory merge semantics**: directory-to-directory restore now merges recursively (per-file conflict policy) — local-only files are never swallowed by a whole-directory replacement.
+- **Apple-style UI redesign**: card layout, iconified section headers, primary/secondary buttons, terminal-style log — zero functional changes.
+- **Safety hardening**: import cleanup is limited to files extracted from the package (local-only session files are never deleted); high-risk operations require confirmation.
+- **Performance**: file stats and full-disk scans moved to background threads (generation-guarded), each zip is extracted only once, project space first paint is instant with lazy size backfill.
 - Native SwiftUI app, Universal (Apple Silicon + Intel), minimum macOS 12 — drag into Applications and it just works, no helper scripts.
 
 ### Quick start
-1. Download `12-WBMemoryMigrator-1.1-universal.dmg` from Releases.
+1. Download `12-WBMemoryMigrator-1.2-universal.dmg` from Releases.
 2. Open the DMG and drag `WBMemoryMigrator.app` into Applications.
 3. First launch: right-click → Open (or run `xattr -dr com.apple.quarantine /Applications/WBMemoryMigrator.app` in Terminal).
 4. Check the categories you want → click Export → get a single zip backup.

@@ -21,7 +21,7 @@
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2026 banqiu. All rights reserved.</string>
+    <string>Copyright © 2026 banqiu. Released under the MIT License.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>LSApplicationCategoryType</key>

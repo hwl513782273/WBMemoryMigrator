@@ -30,10 +30,11 @@
 - **Apple 风格 UI 重设计**：卡片化布局、图标化区块标题、主次分明按钮、终端风日志，功能零改动。
 - **安全加固**：导入清理范围限定为包内解压文件（本机原有会话文件不再被误删）；高危操作弹窗确认。
 - **性能**：文件统计与全盘扫描挪后台线程（代数校验防乱序），同一个 zip 只解压一次，项目空间首屏秒出、大小懒加载回填。
+- **SpaceMover 迁移工作区全链路支持**：导出时自动识别「反向软链迁移」的工作区（按真实位置收集，记录原登记路径），导入时按原登记路径的目录结构自动还原并注册——迁移过的工作区换机后开箱即用，UI 带「已迁移」徽标。
 - 原生 SwiftUI App，Universal（Apple Silicon + Intel），最低 macOS 12，拖入「应用程序」即用，无依赖脚本。
 
 ### 快速开始
-1. 在 Releases 下载 `12-WBMemoryMigrator-1.2-universal.dmg`。
+1. 在 Releases 下载 `12-WBMemoryMigrator-1.3-universal.dmg`。
 2. 打开 DMG，把 `WBMemoryMigrator.app` 拖入「应用程序」。
 3. 首次打开：右键 → 打开（或终端执行 `xattr -dr com.apple.quarantine /Applications/WBMemoryMigrator.app`）。
 4. 勾选要迁移的数据类别 → 点击「导出」，得到一个 zip 备份包。
@@ -89,10 +90,11 @@ bash make_dmg.sh   # hdiutil 打包 DMG
 - **Apple-style UI redesign**: card layout, iconified section headers, primary/secondary buttons, terminal-style log — zero functional changes.
 - **Safety hardening**: import cleanup is limited to files extracted from the package (local-only session files are never deleted); high-risk operations require confirmation.
 - **Performance**: file stats and full-disk scans moved to background threads (generation-guarded), each zip is extracted only once, project space first paint is instant with lazy size backfill.
+- **SpaceMover full-chain support**: detects symlink-migrated workspaces on export (collects from the real location, records the registered path), and on import recreates the original directory structure at the registered path and registers it — migrated workspaces work out of the box on a new machine, with a "migrated" badge in the UI.
 - Native SwiftUI app, Universal (Apple Silicon + Intel), minimum macOS 12 — drag into Applications and it just works, no helper scripts.
 
 ### Quick start
-1. Download `12-WBMemoryMigrator-1.2-universal.dmg` from Releases.
+1. Download `12-WBMemoryMigrator-1.3-universal.dmg` from Releases.
 2. Open the DMG and drag `WBMemoryMigrator.app` into Applications.
 3. First launch: right-click → Open (or run `xattr -dr com.apple.quarantine /Applications/WBMemoryMigrator.app` in Terminal).
 4. Check the categories you want → click Export → get a single zip backup.

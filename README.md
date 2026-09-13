@@ -1,6 +1,6 @@
 # WBMemoryMigrator / WorkBuddy 记忆备份
 
-> 一款 macOS 原生的 WorkBuddy 数据一键导出 / 导入工具：长期记忆文件 · 对话记忆 · 全部 Skill · 项目空间，换机迁移一个 App 搞定。/ A native macOS one-click export & import tool for WorkBuddy data — long-term memory, conversation history, all Skills, and project workspaces. Migrate to a new Mac with a single app.
+> 一款 WorkBuddy 数据一键导出 / 导入工具：长期记忆文件 · 对话记忆 · 全部 Skill · 项目空间，换机迁移一个 App 搞定。macOS 原生 SwiftUI 版 + Windows（Tauri v2）版，两版备份包互通。/ A one-click export & import tool for WorkBuddy data — long-term memory, conversation history, all Skills, and project workspaces. Native SwiftUI edition for macOS + Tauri v2 edition for Windows, with fully interoperable backup archives.
 
 > **作者 Author：banqiu**
 > **许可证 License：MIT**（详见 LICENSE）。可自由使用、修改与再分发，须保留版权与许可声明。
@@ -68,6 +68,25 @@ bash make_dmg.sh   # hdiutil 打包 DMG
 - App 未公证（notarized），首次打开需右键「打开」放行 Gatekeeper。
 - 导入会覆盖同路径的现有记忆文件（覆盖前自动备份）；若你在两台机器上同时改过同一份记忆，请自行取舍合并。
 - 对话记忆快照基于本地 `workbuddy.db`；WorkBuddy 云端按账号同步的部分以云端为准，本工具不涉及云端数据。
+
+---
+
+## Windows 版 / Windows Edition
+
+> **v1.3 起提供 Windows 版**（Tauri v2 GUI，Windows 10/11 x64），与 macOS 版**备份包互通**：Mac 上导出的 zip 可直接在 Windows 导入，反之亦然。/ Since v1.3 there is a Windows edition (Tauri v2 GUI). Its backup archives are fully interoperable with the macOS edition — a zip exported on Mac imports on Windows, and vice versa.
+
+### 下载 / Download
+- Releases 页下载 `WBMemoryMigrator-1.3-win-x64.exe`（安装/绿色二合一，构建产物由 GitHub Actions `windows-latest` 编译，附 SHA-256 checksums）。
+
+### 与 Mac 版互通的关键能力 / Cross-platform capabilities
+- **manifest 字段级互通**：备份包 `manifest` 格式与 Mac 版完全一致，跨平台互导无需任何转换步骤。/ Backup `manifest` schema is field-level identical to the macOS edition — no conversion step needed.
+- **账号过户**：导入的会话自动过户到当前账号，跨账号导入不再「隐身」。/ Imported sessions are automatically re-owned to the current account.
+- **会话 jsonl 自动归位（win_slug）**：按导入映射自动改写会话工作目录，Windows 侧按 slug 重建会话文件落位。/ Session jsonl files are re-located per import mapping with Windows-side slug handling.
+- **冲突三策略**：始终覆盖 / 保留较新 / 跳过冲突，与 Mac 版一致。/ Three conflict policies (always overwrite / keep newer / skip conflicts), same as macOS.
+
+### Windows 注意事项 / Windows notes
+- exe 未做代码签名，SmartScreen 首次可能拦截：点「更多信息 → 仍要运行」。/ The exe is not code-signed; SmartScreen may warn on first run — click "More info → Run anyway".
+- 导入前建议先退出 WorkBuddy，避免数据库 / 会话文件被占用。/ Quit WorkBuddy before importing to avoid file locks.
 
 ---
 

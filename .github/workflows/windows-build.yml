@@ -33,7 +33,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/wbmemorymigrator.exe dist/WBMemoryMigrator-1.3-win-x64.exe
+          Copy-Item windows-app/src-tauri/target/release/wbmemorymigrator.exe dist/WBMemoryMigrator-1.3-win-x64.exe
           $h = (Get-FileHash dist/WBMemoryMigrator-1.3-win-x64.exe -Algorithm SHA256).Hash.ToLower()
           "$h  WBMemoryMigrator-1.3-win-x64.exe" | Out-File dist/checksums.txt -Encoding ascii
           Get-ChildItem dist

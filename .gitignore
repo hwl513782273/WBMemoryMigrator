@@ -2,3 +2,7 @@ build/
 dmg_staging/
 *.dmg
 .DS_Store
+
+# Windows 版构建产物
+windows-app/src-tauri/target/
+windows-app/src-tauri/gen/

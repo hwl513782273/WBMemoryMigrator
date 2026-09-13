@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WBMemoryMigrator</title>
+<style>
+:root {
+  --bg: #f2f2f7; --card: #ffffff; --border: rgba(0,0,0,.08);
+  --text: #1c1c1e; --sub: #6e6e73; --accent: #0a84ff; --warn: #ff9f0a; --danger: #ff453a;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #1c1c1e; --card: #2c2c2e; --border: rgba(255,255,255,.1);
+    --text: #f2f2f7; --sub: #98989d; --accent: #0a84ff; --warn: #ffd60a; --danger: #ff453a; }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  background: var(--bg); color: var(--text); font-size: 14px; padding: 20px 24px; overflow-y: auto; }
+h1 { font-size: 24px; font-weight: 700; text-align: center; }
+.subtitle { text-align: center; color: var(--sub); margin: 4px 0 18px; font-size: 13px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; margin-bottom: 14px; }
+.card h2 { font-size: 13px; font-weight: 600; color: var(--sub); margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+.row { display: flex; align-items: center; gap: 10px; }
+.spacer { flex: 1; }
+.toggle-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 14px; }
+.toggle-row .size { color: var(--sub); font-size: 12px; }
+.toggle-row.locked { opacity: .45; pointer-events: none; }
+.btn { border: 1px solid var(--border); background: var(--card); color: var(--text);
+  border-radius: 8px; padding: 7px 16px; font-size: 13px; cursor: pointer; transition: opacity .15s; }
+.btn:hover { opacity: .8; }
+.btn.primary { background: var(--accent); color: #fff; border: none; font-weight: 600; padding: 10px 26px; font-size: 14px; }
+.btn.small { padding: 4px 10px; font-size: 12px; }
+.btn:disabled { opacity: .4; cursor: default; }
+.actionbar { display: flex; gap: 14px; justify-content: center; margin: 18px 0; }
+.scrolllist { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+.ws-group { margin-bottom: 6px; }
+.ws-head { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-weight: 600; }
+.entry { display: flex; align-items: center; gap: 6px; padding: 2px 0 2px 22px; font-size: 13px; }
+.entry .size, .ws-head .size { color: var(--sub); font-size: 11px; margin-left: 4px; }
+.badge { font-size: 10px; background: var(--accent); color: #fff; border-radius: 4px; padding: 1px 5px; }
+.checkbox { accent-color: var(--accent); width: 15px; height: 15px; }
+.progresswrap { margin: 10px 0 4px; display: none; }
+.progresswrap.show { display: block; }
+.progressbar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+.progressbar > div { height: 100%; background: var(--accent); width: 0%; transition: width .3s; }
+.phasetext { font-size: 12px; color: var(--sub); margin-top: 4px; text-align: center; }
+#log { height: 130px; overflow-y: auto; background: rgba(128,128,128,.06); border-radius: 10px;
+  padding: 8px 10px; font-family: Consolas, monospace; font-size: 11px; color: var(--sub); white-space: pre-wrap; word-break: break-all; }
+.convs { max-height: 180px; }
+.conv { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; border-bottom: 1px solid var(--border); }
+.conv:last-child { border-bottom: none; }
+.conv .meta { color: var(--sub); font-size: 11px; }
+select, input[type=text] { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+  background: var(--card); color: var(--text); font-size: 13px; }
+.hidden { display: none !important; }
+.warnline { color: var(--warn); font-size: 12px; }
+.hint { color: var(--sub); font-size: 11px; }
+.preview { height: 140px; }
+.note { font-size: 12px; color: var(--sub); margin-top: 8px; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<h1>WorkBuddy 记忆备份（Windows 版）</h1>
+<div class="subtitle">长期记忆 · 对话记忆 · 全部 Skill · 项目空间 — 与 macOS 版备份包互通</div>
+
+<!-- 导出范围 -->
+<div class="card">
+  <h2>✓ 导出范围（可单独勾选）</h2>
+  <div class="toggle-row"><input type="checkbox" class="checkbox" id="optMemory" checked>
+    <label for="optMemory">长期记忆文件</label><span class="size" id="sizeMemory"></span></div>
+  <div class="toggle-row"><input type="checkbox" class="checkbox" id="optConversations" checked>
+    <label for="optConversations">对话记忆</label><span class="size" id="sizeConversations"></span></div>
+  <div class="toggle-row"><input type="checkbox" class="checkbox" id="optSkills" checked>
+    <label for="optSkills">全部 Skill</label><span class="size" id="sizeSkills"></span></div>
+  <div class="toggle-row"><input type="checkbox" class="checkbox" id="optProjectSpaces">
+    <label for="optProjectSpaces">项目空间（指定工作区的源码本体）</label><span class="size" id="sizeProjects"></span></div>
+</div>
+
+<!-- 项目空间面板 -->
+<div class="card" id="projectPanel">
+  <h2>📁 项目空间包含的工作区与子目录
+    <span class="spacer"></span>
+    <button class="btn small" id="btnScanSettings">扫描设置</button>
+    <button class="btn small" id="btnSelAllWs">全选</button>
+    <button class="btn small" id="btnDeselAllWs">全不选</button>
+  </h2>
+  <div class="hint" id="projectHint">正在扫描工作区…</div>
+  <div class="row" style="margin:6px 0">
+    <label><input type="radio" name="showmode" value="ws" id="modeWsOnly"> 只显示工作区</label>
+    <label><input type="radio" name="showmode" value="full" id="modeFull" checked> 显示工作区与子目录</label>
+  </div>
+  <div class="scrolllist" id="wsList"></div>
+  <div id="scanSettings" class="hidden">
+    <div class="note">把项目挪入的「收容所」文件夹加进来，导出/导入时会到这里深度搜索（6 层）。</div>
+    <div id="scanRootList"></div>
+    <div class="row" style="margin-top:6px">
+      <button class="btn small" id="btnAddScanRoot">添加扫描路径…</button>
+      <span class="hint">改动后立即生效</span>
+    </div>
+  </div>
+</div>
+
+<div class="actionbar">
+  <button class="btn primary" id="btnExport">⬆ 导出备份</button>
+  <button class="btn" id="btnChooseZip">⬇ 选择备份包导入…</button>
+</div>
+
+<!-- 导入区 -->
+<div id="importArea" class="hidden">
+  <div class="card">
+    <h2>⬇ 导入范围（可单独勾选）</h2>
+    <div class="toggle-row" id="rowIMemory"><input type="checkbox" class="checkbox" id="iOptMemory" checked>
+      <label for="iOptMemory">长期记忆文件</label><span class="size" id="iSizeMemory"></span></div>
+    <div class="toggle-row" id="rowIConversations"><input type="checkbox" class="checkbox" id="iOptConversations" checked>
+      <label for="iOptConversations">对话记忆</label><span class="size" id="iSizeConversations"></span></div>
+    <div class="toggle-row" id="rowISkills"><input type="checkbox" class="checkbox" id="iOptSkills" checked>
+      <label for="iOptSkills">全部 Skill</label><span class="size" id="iSizeSkills"></span></div>
+    <div class="toggle-row" id="rowIProjects"><input type="checkbox" class="checkbox" id="iOptProjects" checked>
+      <label for="iOptProjects">项目空间</label><span class="size" id="iSizeProjects"></span></div>
+  </div>
+
+  <div class="card" id="convCard">
+    <h2>💬 选择要恢复的对话 <span class="spacer"></span>
+      <button class="btn small" id="btnSelAllConv">全选</button>
+      <button class="btn small" id="btnDeselAllConv">全不选</button></h2>
+    <div class="hint" id="convHint"></div>
+    <div class="scrolllist convs" id="convList"></div>
+    <div class="note" id="takeoverLine"></div>
+    <div class="row hidden" id="manualUidRow">
+      <span class="warnline">未探测到本机账号，可手动填写目标账号 id（留空则不改）:</span>
+      <input type="text" id="manualUid" placeholder="user_id" style="width:280px">
+    </div>
+  </div>
+
+  <div class="card" id="targetCard">
+    <h2>📁 项目空间目标目录（不选则按原目录结构自动创建并注册）</h2>
+    <div id="targetList"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:8px">
+      <span>冲突策略：</span>
+      <label><input type="radio" name="cpolicy" value="always" checked> 始终覆盖</label>
+      <label><input type="radio" name="cpolicy" value="keep_newer"> 保留较新</label>
+      <label><input type="radio" name="cpolicy" value="skip"> 跳过冲突</label>
+    </div>
+    <label class="toggle-row"><input type="checkbox" class="checkbox" id="iArchiveMissing">
+      目标工作区不存在时归档到 workspace_memory_archive（默认关闭=按原目录结构自动创建并注册）</label>
+    <div class="hint">→ 导入预览（共 <span id="previewCount">0</span> 项）</div>
+    <div class="scrolllist preview" id="previewList"></div>
+  </div>
+
+  <div class="actionbar">
+    <button class="btn primary" id="btnConfirmImport">✓ 确认导入</button>
+  </div>
+</div>
+
+<div class="progresswrap" id="progressWrap">
+  <div class="progressbar"><div id="progressBar"></div></div>
+  <div class="phasetext" id="phaseText"></div>
+</div>
+
+<div class="card">
+  <h2>⌨ 日志</h2>
+  <div id="log"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

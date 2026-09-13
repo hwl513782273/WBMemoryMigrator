@@ -1,0 +1,23 @@
+[package]
+name = "wbmemorymigrator"
+version = "1.3.0"
+edition = "2021"
+description = "WBMemoryMigrator for Windows — WorkBuddy memory/conversations/skills/project-spaces backup & restore"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2"
+chrono = "0.4"
+rfd = "0.15"
+
+[profile.release]
+opt-level = 2
+strip = true
+lto = true
